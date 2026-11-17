@@ -1,263 +1,324 @@
-/* SHADOW ARCHITECT — level loader + room layout.
-   Levels are DATA (src/levels.js registry, or any plain object with
-   the same shape — e.g. a test JSON file). This module only:
-     - resolves a level by id (SA.Levels registry) or validates a
-       raw definition,
-     - builds the orientation-aware room layout from a level def,
-     - scores stars from a level's par table,
-     - scores per-band shadow fit for the HUD indicators.
-   The engine loads a level by id and needs NO code changes for a
-   new level. Works in the browser as SA.Level and under Node as
-   module.exports (the registry is pulled in below for Node).
-*/
-var SA = (typeof SA !== 'undefined') ? SA : {};
-SA.Level = (function () {
+/* Shadow Architect — level resolution, validation, star rating.
+ *
+ * Resolving a level into a playable layout for an orientation,
+ * checking level data, and the star rule from spec sections 3, 5
+ * and 6. No screen, no storage, no network.
+ */
+(function (root) {
   'use strict';
 
-  // Band lights up when its per-band score reaches this value.
-  var BAND_THRESHOLD = 0.85;
+  var SA = root.SA || (root.SA = {});
 
-  // Required shape of a level definition (see src/levels.js header).
-  function validateLevelData(def) {
-    if (!def || typeof def !== 'object') return 'level def must be an object';
-    if (typeof def.id !== 'string' || !def.id) return 'level def needs a string id';
-    if (!Array.isArray(def.objects) || !def.objects.length) return 'level def needs a non-empty objects array';
-    for (var i = 0; i < def.objects.length; i++) {
-      var o = def.objects[i];
-      if (!o.id || !o.shape || typeof o.cx !== 'number' || typeof o.cy !== 'number' ||
-          typeof o.r !== 'number' || typeof o.rotDeg !== 'number') {
-        return 'object #' + i + ' needs id/shape/cx/cy/r/rotDeg';
-      }
+  var SHAPES = ['triangle', 'ring', 'hexagon'];
+  var ORIENTATIONS = ['landscape', 'portrait'];
+
+  /* Star thresholds by difficulty (spec section 3). Only normal
+   * is defined for this game. */
+  var STAR_THRESHOLDS = {
+    normal: {
+      three: { moves: 25, seconds: 120, match: 0.95, hints: 1 },
+      two: { moves: 40, seconds: 240, match: 0.90, hints: 3 }
     }
-    if (!def.light || def.light.type !== 'point' || !def.light.home ||
-        !def.light.home.landscape || !def.light.home.portrait) {
-      return 'level def needs light { type: "point", home: { landscape, portrait } }';
-    }
-    if (!def.target || !def.target.landscape || !def.target.portrait ||
-        !Array.isArray(def.target.landscape.bands) || !Array.isArray(def.target.portrait.bands) ||
-        !Array.isArray(def.target.landscape.widths) || !Array.isArray(def.target.portrait.widths) ||
-        def.target.landscape.bands.length !== def.target.landscape.widths.length ||
-        def.target.portrait.bands.length !== def.target.portrait.widths.length) {
-      return 'level def needs target { landscape/portrait: { bands[], widths[] } } with matching lengths';
-    }
-    if (!def.win || def.win.type !== 'match' || typeof def.win.threshold !== 'number' ||
-        def.win.threshold <= 0 || def.win.threshold > 1) {
-      return 'level def needs win { type: "match", threshold: 0..1 }';
-    }
-    // Stars accepts BOTH forms. Legacy array form is read as the
-    // 'normal' table with minMatch 0.90 / maxHints Infinity (see
-    // parFor below). Object form is per-difficulty:
-    // { normal: [...], hard: [...], hell: [...] }, each table two
-    // rows {moves, seconds} with optional minMatch / maxHints.
-    // 'normal' must be present in object form.
-    var starsErr = validateStars(def.stars);
-    if (starsErr) return starsErr;
-    if (def.difficulty !== undefined &&
-        (def.difficulty !== 'normal' && def.difficulty !== 'hard' && def.difficulty !== 'hell')) {
-      return 'level def difficulty must be "normal", "hard" or "hell"';
-    }
-    if (!Array.isArray(def.hints) || !def.hints.length) return 'level def needs a non-empty hints array';
-    if (!('moveLimit' in def)) return 'level def needs moveLimit (null = unlimited)';
-    return null; // valid
+  };
+
+  function isFiniteNumber(v) {
+    return typeof v === 'number' && isFinite(v);
   }
 
-  // One par row: { moves, seconds } plus optional minMatch / maxHints.
-  function validateParRow(row) {
-    if (!row || typeof row !== 'object' ||
-        typeof row.moves !== 'number' || typeof row.seconds !== 'number') return false;
-    if (row.minMatch !== undefined &&
-        (typeof row.minMatch !== 'number' || row.minMatch <= 0 || row.minMatch > 1)) return false;
-    if (row.maxHints !== undefined &&
-        (typeof row.maxHints !== 'number' || row.maxHints < 0)) return false;
-    return true;
-  }
-  function validateStars(stars) {
-    if (Array.isArray(stars)) {
-      if (stars.length !== 2 || !validateParRow(stars[0]) || !validateParRow(stars[1])) {
-        return 'level def needs stars: [{moves, seconds}, {moves, seconds}]';
-      }
-      return null;
-    }
-    if (stars && typeof stars === 'object') {
-      var keys = Object.keys(stars);
-      if (!keys.length) return 'level def needs stars with at least a normal table';
-      for (var i = 0; i < keys.length; i++) {
-        var k = keys[i];
-        if (k !== 'normal' && k !== 'hard' && k !== 'hell') {
-          return 'level def stars keys must be "normal", "hard" or "hell"';
-        }
-        var rows = stars[k];
-        if (!Array.isArray(rows) || rows.length !== 2 ||
-            !validateParRow(rows[0]) || !validateParRow(rows[1])) {
-          return 'level def stars.' + k + ' needs [{moves, seconds}, {moves, seconds}]';
-        }
-      }
-      if (!stars.normal) return 'level def stars object needs a "normal" table';
-      return null;
-    }
-    return 'level def needs stars: [{moves, seconds}, {moves, seconds}] or { normal: [...], hard: [...], hell: [...] }';
+  function deepCopy(value) {
+    return JSON.parse(JSON.stringify(value));
   }
 
-  // Resolve a level by id from the registry (deep copy). Returns null
-  // for an unknown id. Raw defs (e.g. a test JSON file) go through
-  // validateLevelData + SA.Levels.clone instead.
-  function resolveLevel(id) {
-    if (typeof SA.Levels === 'undefined' || !SA.Levels.get) return null;
-    return SA.Levels.get(id);
+  function normalOrientation(orientation) {
+    return orientation === 'portrait' ? 'portrait' : 'landscape';
   }
 
-  // Orientation-aware ROOM layout. Room geometry (canvas size, wall,
-  // stage, light zone) is shared by every level; the level def
-  // supplies only its own light home + target silhouette per
-  // orientation.
-  function makeLayout(orientation, levelDef) {
-    var level = levelDef || resolveLevel('level-01');
-    var t = level.target[orientation] || level.target.landscape;
-    var home = level.light.home[orientation] || level.light.home.landscape;
-    if (orientation === 'portrait') {
-      return {
-        orientation: 'portrait',
-        W: 720, H: 1280,
-        axis: 'y', wall: 1010, wallSpan: [80, 640],
-        wallThick: 64,
-        // Wall moved up from 1090 so its bottom (1074 virtual =
-        // 537px on a 360x640 screen) clears the touch bar (top edge
-        // 584px) with 47px to spare; the wall panel bottom (1114
-        // virtual = 557px) clears it by 27px. Stage bottom (980)
-        // keeps a 30-virtual gap to the wall top.
-        lightHome: { x: home.x, y: home.y },
-        lightZone: { x: [120, 600], y: [90, 300] },
-        stage: { x: [90, 630], y: [360, 980] },
-        target: t.bands,
-        targetWidths: t.widths
-      };
-    }
-    return {
-      orientation: 'landscape',
-      W: 1280, H: 720,
-      axis: 'x', wall: 1080, wallSpan: [90, 630],
-      wallThick: 64,
-      lightHome: { x: home.x, y: home.y },
-      lightZone: { x: [90, 300], y: [120, 600] },
-      stage: { x: [360, 980], y: [90, 630] },
-      target: t.bands,
-      targetWidths: t.widths
-    };
+  function shapeKind(object) {
+    if (!object) return '';
+    return String(object.shape || object.type || object.kind || '').toLowerCase();
   }
 
-  // Normalized par table for a level's difficulty — two rows
-  // { moves, seconds, minMatch, maxHints }. Legacy array-form stars
-  // are read as 'normal' with minMatch 0.90 / maxHints Infinity.
-  // Object-form stars pick level.difficulty (default 'normal'),
-  // falling back to the 'normal' table when that difficulty has no
-  // table yet. A level with no stars at all falls back to the
-  // v0.7.1 default pars.
-  function parFor(level) {
-    var stars = level && level.stars;
-    var rows = null;
-    if (stars && !Array.isArray(stars) && typeof stars === 'object') {
-      var diff = (level && level.difficulty) || 'normal';
-      rows = stars[diff] || stars.normal;
-    } else if (Array.isArray(stars)) {
-      rows = stars;
-    }
-    if (!rows) rows = [{ moves: 40, seconds: 180 }, { moves: 80, seconds: 600 }];
-    function norm(row) {
-      return {
-        moves: row.moves, seconds: row.seconds,
-        minMatch: (typeof row.minMatch === 'number') ? row.minMatch : 0.90,
-        maxHints: (typeof row.maxHints === 'number') ? row.maxHints : Infinity
-      };
-    }
-    return [norm(rows[0]), norm(rows[1])];
+  /* Return the star thresholds for a difficulty, as a fresh copy,
+   * or null when the difficulty is not defined. Each tier carries
+   * the four limits under both short and long names. */
+  function starThresholds(difficulty) {
+    var name = difficulty || 'normal';
+    var found = STAR_THRESHOLDS[name];
+    var copy;
+    if (!found) return null;
+    copy = deepCopy(found);
+    copy.three.maxMoves = copy.three.moves;
+    copy.three.maxSeconds = copy.three.seconds;
+    copy.three.minMatch = copy.three.match;
+    copy.three.maxHints = copy.three.hints;
+    copy.two.maxMoves = copy.two.moves;
+    copy.two.maxSeconds = copy.two.seconds;
+    copy.two.minMatch = copy.two.match;
+    copy.two.maxHints = copy.two.hints;
+    return copy;
   }
 
-  // Star rating — AND model over 4 factors (moves, seconds,
-  // accuracy, hints). New call: starsFor(moves, seconds, match,
-  // hintsUsed, level), where match is the CONFIRMATION match (never
-  // the drag peak) and hintsUsed counts deliberate Hint-button
-  // presses only. 3 stars iff every par-0 bound holds, 2 stars iff
-  // every par-1 bound holds, else 1 (only meaningful on completion).
-  // Old 3-arg call starsFor(moves, seconds, level) still works:
-  // match / hints default to "unknown, do not penalize" (match 1,
-  // hints 0), so legacy callers and legacy array-form levels rate
-  // exactly as before.
-  function starsFor(moves, seconds, match, hintsUsed, level) {
-    if (match && typeof match === 'object' && level === undefined) {
-      level = match; match = undefined; hintsUsed = undefined;
+  /* Star rating (spec section 3). Three stars need all four
+   * three-star limits at once; two stars need all four two-star
+   * limits at once; anything else is one star. The first argument
+   * is a thresholds object as returned by starThresholds. An
+   * object-form call is also accepted. */
+  function starRating(thresholds, moves, seconds, match, hints) {
+    var t = thresholds;
+    var three;
+    var two;
+    if (t && typeof t === 'object' && !t.three && typeof moves === 'object' && moves !== null) {
+      /* Object form: starRating({ thresholds, moves, seconds, match, hints }) */
+      var opts = moves;
+      t = opts.thresholds || opts.starThresholds || null;
+      moves = opts.moves;
+      seconds = opts.seconds;
+      match = opts.match;
+      hints = opts.hints;
     }
-    var par = parFor(level);
-    var m = (typeof match === 'number') ? match : 1;
-    var h = (typeof hintsUsed === 'number') ? hintsUsed : 0;
-    if (moves <= par[0].moves && seconds <= par[0].seconds &&
-        m >= par[0].minMatch && h <= par[0].maxHints) return 3;
-    if (moves <= par[1].moves && seconds <= par[1].seconds &&
-        m >= par[1].minMatch && h <= par[1].maxHints) return 2;
+    if (!t || !t.three || !t.two) return 1;
+    three = t.three;
+    two = t.two;
+    if (moves <= three.moves && seconds <= three.seconds &&
+        match >= three.match && hints <= three.hints) {
+      return 3;
+    }
+    if (moves <= two.moves && seconds <= two.seconds &&
+        match >= two.match && hints <= two.hints) {
+      return 2;
+    }
     return 1;
   }
 
-  // Per-band shadow fit for the HUD indicators. Accepts a live
-  // engine state object — { shadowIntervals, target } (or the
-  // aliases { shadows, bands }) — or the two raw interval arrays
-  // directly: bandScores(shadowIntervals, targetIntervals).
-  // Returns one score 0..1 per band; a band lights when its score
-  // reaches BAND_THRESHOLD (0.85). Scoring is the SA.Math per-band
-  // rule: the best single object's interval IoU against the band,
-  // NOT union coverage (see src/math.js bandScores — union coverage
-  // would light band 3 at the level start, before the player acts).
-  // When SA.Math is unavailable, falls back to computing the same
-  // single-object IoU inline from a state carrying objects + light
-  // + layout.
-  function bandScores(state, targetIntervals) {
-    var shadows = null, target = null;
-    if (Array.isArray(state)) {
-      shadows = state;
-      target = targetIntervals;
-    } else if (state && typeof state === 'object') {
-      shadows = state.shadowIntervals || state.shadows || state.intervals || null;
-      target = state.target || state.bands || targetIntervals || null;
-      if (!shadows && state.objects && state.light && state.layout && typeof SA.Math !== 'undefined') {
-        shadows = [];
-        for (var i = 0; i < state.objects.length; i++) {
-          shadows.push(SA.Math.shadowInterval(state.objects[i], state.light, state.layout));
-        }
-        if (!target) target = state.layout.target;
-      }
-    }
-    if (!shadows || !target) return [];
-    if (typeof SA.Math !== 'undefined' && SA.Math.bandScores) {
-      return SA.Math.bandScores(shadows, target);
-    }
-    var out = [];
-    for (var b = 0; b < target.length; b++) {
-      var band = target[b], best = 0;
-      for (var j = 0; j < shadows.length; j++) {
-        var iv = shadows[j];
-        if (!iv) continue;
-        var inter = Math.max(0, Math.min(iv[1], band[1]) - Math.max(iv[0], band[0]));
-        var uni = Math.max(iv[1], band[1]) - Math.min(iv[0], band[0]);
-        var score = uni <= 0 ? 0 : inter / uni;
-        if (score > best) best = score;
-      }
-      out.push(best);
-    }
-    return out;
+  /* Convenience: rate with the thresholds of a named difficulty. */
+  function starsForDifficulty(difficulty, moves, seconds, match, hints) {
+    var thresholds = starThresholds(difficulty);
+    if (!thresholds) return 1;
+    return starRating(thresholds, moves, seconds, match, hints);
   }
 
-  var api = {
-    BAND_THRESHOLD: BAND_THRESHOLD,
-    makeLayout: makeLayout,
+  /* Resolve a level identifier (or a level object) into level data
+   * for an orientation. The returned data is a fresh copy: object
+   * positions are landscape in the tables and are scaled to
+   * portrait by the section 2 rule when the orientation is
+   * portrait; the light home and target bands are the per-
+   * orientation values from the tables. Returns null for an
+   * unknown identifier. */
+  function resolveLevel(levelOrId, orientation) {
+    var o = normalOrientation(orientation);
+    var source = null;
+    var resolved;
+    var math;
+    var i;
+    if (typeof levelOrId === 'string') {
+      if (SA.Levels && SA.Levels.getLevel) source = SA.Levels.getLevel(levelOrId);
+      if (!source) return null;
+    } else if (levelOrId && typeof levelOrId === 'object') {
+      source = deepCopy(levelOrId);
+    } else {
+      return null;
+    }
+    resolved = source;
+    resolved.orientation = o;
+    math = SA.Math;
+    if (o === 'portrait' && math && math.toPortraitPosition) {
+      for (i = 0; i < (resolved.objects || []).length; i++) {
+        var scaled = math.toPortraitPosition(resolved.objects[i]);
+        resolved.objects[i].x = scaled.x;
+        resolved.objects[i].y = scaled.y;
+      }
+    }
+    if (resolved.lightHome) {
+      resolved.light = deepCopy(resolved.lightHome[o] || resolved.lightHome.landscape);
+      resolved.lightHomePosition = resolved.light;
+    }
+    if (resolved.targets) {
+      resolved.targetBands = deepCopy(resolved.targets[o] || resolved.targets.landscape);
+      resolved.targetsForOrientation = resolved.targetBands;
+    }
+    return resolved;
+  }
+
+  /* Build the playable layout for a resolved level and an
+   * orientation. Holds the world size, the wall position and
+   * thickness, the objects with their start positions, the light
+   * home, and the target bands for that orientation. */
+  function buildLayout(resolvedLevel, orientation) {
+    var o = normalOrientation(orientation);
+    var level = resolvedLevel;
+    var board;
+    var wall;
+    var objects;
+    var i;
+    if (!level) return null;
+    /* Accept a level identifier as well as a resolved level. */
+    if (typeof level === 'string') level = resolveLevel(level, o);
+    if (!level) return null;
+    /* If the level has not been resolved for this orientation yet,
+     * resolve its positions now, without mutating the input. */
+    if (level.orientation !== o) level = resolveLevel(level, o);
+    if (!level) return null;
+    board = (SA.Math && SA.Math.boardSize) ? SA.Math.boardSize(o)
+      : (o === 'portrait' ? { width: 720, height: 1280 } : { width: 1280, height: 720 });
+    wall = (SA.Math && SA.Math.wall) ? SA.Math.wall(o)
+      : (o === 'portrait' ? { position: 1010, thickness: 64, axis: 'y' }
+                          : { position: 1080, thickness: 64, axis: 'x' });
+    objects = (level.objects || []).map(function (object) {
+      return deepCopy(object);
+    });
+    /* Start positions are the object positions in the resolved
+     * level; keep them under both names for callers. */
+    for (i = 0; i < objects.length; i++) {
+      objects[i].startX = objects[i].x;
+      objects[i].startY = objects[i].y;
+    }
+    var light = level.light || level.lightHomePosition ||
+      (level.lightHome && (level.lightHome[o] || level.lightHome.landscape)) || { x: 0, y: 0 };
+    var bands = level.targetBands || level.targetsForOrientation ||
+      (level.targets && (level.targets[o] || level.targets.landscape)) || [];
+    return {
+      id: level.id,
+      levelId: level.id,
+      name: level.name,
+      chapter: level.chapter,
+      difficulty: level.difficulty || 'normal',
+      orientation: o,
+      world: { width: board.width, height: board.height },
+      worldWidth: board.width,
+      worldHeight: board.height,
+      width: board.width,
+      height: board.height,
+      wall: { position: wall.position, thickness: wall.thickness, axis: wall.axis },
+      wallPosition: wall.position,
+      wallThickness: wall.thickness,
+      wallAxis: wall.axis,
+      wallX: o === 'landscape' ? wall.position : null,
+      wallY: o === 'portrait' ? wall.position : null,
+      objects: objects,
+      light: deepCopy(light),
+      lightHome: deepCopy(light),
+      targetBands: deepCopy(bands),
+      targets: deepCopy(bands),
+      winType: level.winType || 'match',
+      winThreshold: isFiniteNumber(level.winThreshold) ? level.winThreshold : 0.9,
+      hints: level.hints ? deepCopy(level.hints) : []
+    };
+  }
+
+  /* Validate level data and report every problem found.
+   * Returns { valid, errors, problems } where errors is the list
+   * of problem strings (problems is the same list). A level with
+   * no problems is valid. */
+  function validateLevel(levelOrId) {
+    var errors = [];
+    var level = levelOrId;
+    var i;
+    var object;
+    var ids;
+    var bands;
+    var seen;
+    if (typeof level === 'string') {
+      if (SA.Levels && SA.Levels.getLevel) level = SA.Levels.getLevel(level);
+      if (!level) {
+        errors.push('unknown level id: ' + levelOrId);
+        return { valid: false, errors: errors, problems: errors };
+      }
+    }
+    if (!level || typeof level !== 'object') {
+      errors.push('level data is missing or not an object');
+      return { valid: false, errors: errors, problems: errors };
+    }
+    if (!level.id || typeof level.id !== 'string') errors.push('missing level id');
+    if (!level.name || typeof level.name !== 'string') errors.push('missing level name');
+    if (!isFiniteNumber(level.winThreshold) || level.winThreshold <= 0 || level.winThreshold > 1) {
+      errors.push('winThreshold must be a number between 0 and 1');
+    }
+    if (!Array.isArray(level.objects) || level.objects.length === 0) {
+      errors.push('missing objects: level must have at least one object');
+    } else {
+      ids = {};
+      for (i = 0; i < level.objects.length; i++) {
+        object = level.objects[i];
+        if (!object || typeof object !== 'object') {
+          errors.push('object ' + i + ' is missing or not an object');
+          continue;
+        }
+        if (!object.id || typeof object.id !== 'string') {
+          errors.push('object ' + i + ' is missing an id');
+        } else if (ids[object.id]) {
+          errors.push('duplicate object id: ' + object.id);
+        } else {
+          ids[object.id] = true;
+        }
+        if (SHAPES.indexOf(shapeKind(object)) === -1) {
+          errors.push('object ' + (object.id || i) + ' has unknown shape: ' + (object.shape || object.type));
+        }
+        if (!isFiniteNumber(object.x)) errors.push('object ' + (object.id || i) + ' is missing a finite x');
+        if (!isFiniteNumber(object.y)) errors.push('object ' + (object.id || i) + ' is missing a finite y');
+        if (!isFiniteNumber(object.radius)) {
+          errors.push('object ' + (object.id || i) + ' is missing a finite radius');
+        } else if (object.radius <= 0) {
+          errors.push('object ' + (object.id || i) + ' has a non-positive radius: ' + object.radius);
+        }
+        if (object.rotation !== undefined && !isFiniteNumber(object.rotation)) {
+          errors.push('object ' + (object.id || i) + ' has a non-finite rotation');
+        }
+      }
+    }
+    if (!level.lightHome || typeof level.lightHome !== 'object') {
+      errors.push('missing lightHome');
+    } else {
+      for (i = 0; i < ORIENTATIONS.length; i++) {
+        var home = level.lightHome[ORIENTATIONS[i]];
+        if (!home || !isFiniteNumber(home.x) || !isFiniteNumber(home.y)) {
+          errors.push('missing light home for orientation: ' + ORIENTATIONS[i]);
+        }
+      }
+    }
+    if (!level.targets || typeof level.targets !== 'object') {
+      errors.push('missing targets');
+    } else {
+      for (i = 0; i < ORIENTATIONS.length; i++) {
+        bands = level.targets[ORIENTATIONS[i]];
+        if (!Array.isArray(bands) || bands.length === 0) {
+          errors.push('missing target bands for orientation: ' + ORIENTATIONS[i]);
+          continue;
+        }
+        bands.forEach(function (band, index) {
+          if (!band || !isFiniteNumber(band.low) || !isFiniteNumber(band.high)) {
+            errors.push('target band ' + index + ' (' + ORIENTATIONS[i] + ') is missing finite low/high');
+          } else if (band.low >= band.high) {
+            errors.push('target band ' + index + ' (' + ORIENTATIONS[i] + ') has low >= high');
+          }
+          if (!isFiniteNumber(band.depth) || band.depth <= 0) {
+            errors.push('target band ' + index + ' (' + ORIENTATIONS[i] + ') has a non-positive depth');
+          }
+        });
+      }
+    }
+    if (level.hints !== undefined && !Array.isArray(level.hints)) {
+      errors.push('hints must be an array');
+    }
+    seen = errors.length === 0;
+    return { valid: seen, errors: errors, problems: errors };
+  }
+
+  SA.Level = {
+    STAR_THRESHOLDS: STAR_THRESHOLDS,
     resolveLevel: resolveLevel,
-    validateLevelData: validateLevelData,
-    starsFor: starsFor,
-    parFor: parFor,
-    bandScores: bandScores
+    resolve: resolveLevel,
+    buildLayout: buildLayout,
+    layout: buildLayout,
+    getLayout: buildLayout,
+    validateLevel: validateLevel,
+    validate: validateLevel,
+    starRating: starRating,
+    stars: starRating,
+    rateStars: starRating,
+    starThresholds: starThresholds,
+    thresholds: starThresholds,
+    getStarThresholds: starThresholds,
+    thresholdsFor: starThresholds,
+    starsForDifficulty: starsForDifficulty
   };
-  return api;
-})();
-// Node: each file is its own module scope, so pull the registry in here
-// (in the browser the classic scripts already share one global SA).
-if (typeof module !== 'undefined' && module.exports) {
-  try { SA.Levels = require('./levels.js'); } catch (e) { /* registry unavailable */ }
-  module.exports = SA.Level;
-}
+})(typeof globalThis !== 'undefined' ? globalThis : this);

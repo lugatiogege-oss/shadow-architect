@@ -1,345 +1,426 @@
-/* SHADOW ARCHITECT — DOM UI: screens, HUD, settings, hints, toasts. */
-var SA = (typeof SA !== 'undefined') ? SA : {};
-SA.UI = (function () {
+// Shadow Architect — ui (clean-room rebuild, written from SPEC.md only).
+// Owns every screen, the heads-up display, toasts, display hide/restore,
+// and settings wiring. Screens are shown one at a time by their identifiers
+// from the specification. Time is shown as minutes and seconds, two digits
+// each. Toasts queue at most two at a time: hint toasts stay six seconds,
+// other toasts about two and six tenths seconds.
+(function () {
   'use strict';
-  var game = null;
-  var el = {};
-  var hintTimer = null, toastTimer = null;
-  var lastHud = { match: -1, moves: -1, time: -1 };
 
-  function $(id) { return document.getElementById(id); }
+  var SA = window.SA || (window.SA = {});
 
-  function fmtTime(ms) {
-    var s = Math.floor(ms / 1000);
-    var mm = Math.floor(s / 60);
-    var ss = s % 60;
-    return mm + ':' + (ss < 10 ? '0' + ss : String(ss));
+  var SCREEN_IDS = [
+    'screen-menu',
+    'screen-levels',
+    'screen-settings',
+    'screen-credits',
+    'screen-game',
+    'screen-pause',
+    'screen-complete',
+    'screen-chapter2'
+  ];
+
+  var HINT_TOAST_MS = 6000;
+  var TOAST_MS = 2600;
+  var MAX_TOAST_QUEUE = 2;
+
+  var settingsReturn = 'menu'; // screen to go back to from settings
+  var pauseReturn = 'menu'; // screen settings was opened from, when paused
+  var toastQueue = []; // pending { message, isHint }
+  var toastTimer = null;
+  var toastShowing = false;
+  var wired = false;
+
+  function byId(id) {
+    return document.getElementById(id);
   }
 
-  function bestLabel(best) {
-    if (!best) return '';
-    return 'Best: ' + '★'.repeat(best.stars) + ' · ' + fmtTime(best.timeMs) + ' · ' + best.moves + ' moves';
+  function formatTime(totalSeconds) {
+    var seconds = Math.max(0, Math.floor(totalSeconds || 0));
+    var minutes = Math.floor(seconds / 60);
+    var remainder = seconds % 60;
+    var minuteText = minutes < 10 ? '0' + minutes : String(minutes);
+    var secondText = remainder < 10 ? '0' + remainder : String(remainder);
+    return minuteText + ':' + secondText;
   }
 
-  // The HUD music button mirrors the persisted music setting.
-  function refreshMusicBtn() {
-    var b = $('btn-music');
-    if (!b) return;
-    var on = game.settings.musicOn;
-    b.textContent = on ? '♪ Music' : '♪ Muted';
-    b.classList.toggle('off', !on);
-    b.title = on ? 'Music on — tap to turn off' : 'Music off — tap to turn on';
+  function formatPercent(match) {
+    var value = Math.round((match || 0) * 100);
+    if (value < 0) { value = 0; }
+    if (value > 100) { value = 100; }
+    return value + '%';
   }
 
-  function setMusicOn(on) {
-    game.settings.musicOn = !!on;
-    SA.Audio.setMusicOn(game.settings.musicOn);
-    if (game.settings.musicOn && game.screen === 'playing') SA.Audio.startMusic();
-    game.saveSettings();
-    refreshMusicBtn();
-    var c = $('set-music-on');
-    if (c) c.checked = game.settings.musicOn;
-  }
+  // --- screens -------------------------------------------------------------
 
   function showScreen(name) {
-    var screens = ['menu', 'levels', 'settings', 'credits', 'pause', 'complete', 'chapter2'];
-    var i, s;
-    for (i = 0; i < screens.length; i++) {
-      s = $('screen-' + screens[i]);
-      if (s) s.classList.toggle('hidden', screens[i] !== name);
-    }
-    var inGame = (name === null);
-    $('hud').classList.toggle('hidden', !inGame || game.hudHidden);
-    $('hud-restore').classList.toggle('hidden', !inGame || !game.hudHidden);
-    $('mobile-bar').classList.toggle('hidden', !inGame);
-    clearNotifications(); // screen changes reset toast/hint/queue state
-    if (name === 'levels') refreshLevelBest();
+    // Accept a short name ("menu") or a full identifier ("screen-menu").
+    var id = name.indexOf('screen-') === 0 ? name : 'screen-' + name;
+    SCREEN_IDS.forEach(function (screenId) {
+      var element = byId(screenId);
+      if (!element) { return; }
+      var visible = screenId === id;
+      element.hidden = !visible;
+      element.classList.toggle('active', visible);
+      element.setAttribute('aria-hidden', visible ? 'false' : 'true');
+    });
+    return id;
   }
 
-  function refreshLevelBest() {
-    var b = game.bestScore;
-    $('level-1-best').textContent = b ? bestLabel(b) : 'No completion yet';
-    $('set-best-label').textContent = b ? bestLabel(b) : 'No best score yet';
+  function showMenu() { return showScreen('menu'); }
+  function showLevels() { return showScreen('levels'); }
+  function showSettings(from) {
+    if (from) { settingsReturn = from; }
+    return showScreen('settings');
+  }
+  function showCredits() { return showScreen('credits'); }
+  function showGame() { return showScreen('game'); }
+  function showPause() { return showScreen('pause'); }
+  function showComplete() { return showScreen('complete'); }
+  function showChapter2() { return showScreen('chapter2'); }
+
+  function backFromSettings() {
+    // From pause, settings returns to pause; otherwise to the stored screen.
+    if (settingsReturn === 'pause') { return showPause(); }
+    if (settingsReturn === 'game') { return showGame(); }
+    return showMenu();
   }
 
-  function updateHUD(state, elapsedMs) {
-    var matchPct = Math.round(state.match * 100);
-    if (matchPct !== lastHud.match) {
-      $('hud-match').textContent = matchPct + '%';
-      // Classes belong on the .hud-match box: the % span itself carries
-      // no .hud-match class, so toggling there would do nothing.
-      var matchBox = $('hud-match').parentElement;
-      matchBox.classList.toggle('good', state.match >= 0.90);
-      // 85–89%: the number pulses amber and the label reads ALMOST!,
-      // so a player just under the goal knows they are close.
-      // No solution is revealed.
-      var almost = state.match >= 0.85 && state.match < 0.90;
-      matchBox.classList.toggle('almost', almost);
-      $('hud-match-label').textContent = almost ? 'ALMOST! · goal 90%' : 'MATCH · goal 90%';
-      lastHud.match = matchPct;
-    }
-    if (state.moves !== lastHud.moves) {
-      $('hud-moves').textContent = state.moves + (state.moves === 1 ? ' move' : ' moves');
-      lastHud.moves = state.moves;
-    }
-    var t = Math.floor(elapsedMs / 1000);
-    if (t !== lastHud.time) {
-      $('hud-time').textContent = fmtTime(elapsedMs);
-      lastHud.time = t;
-    }
-  }
+  // --- heads-up display ----------------------------------------------------
 
-  // One notification slot, shared in TIME, never in space. The strip
-  // below the HUD fits exactly one pill in every viewport, so a toast
-  // takes priority for 2.6 s, a visible hint is parked with its
-  // remaining time and restored after the toast hides, a hint requested
-  // during a toast waits, and toasts queue one at a time (max 2 queued;
-  // a duplicate of the toast currently showing is ignored).
-  var TOAST_MS = 2600, HINT_MS = 6000, TOAST_QUEUE_MAX = 2;
-  var hintDeadline = 0;   // performance.now() when the visible hint expires
-  var parkedHint = null;  // { text, deadline } — hidden while a toast shows;
-                          // its 6 s lifetime keeps running while parked, so
-                          // remaining time is computed at RESTORE, not park
-  var pendingHint = null; // { text } — hint requested while a toast shows
-  var toastQueue = [];    // pending toast messages
-  var toastActive = false;
-
-  function showHint(text) {
-    if (toastActive) { pendingHint = { text: text }; return; }
-    parkedHint = null;
-    var bar = $('hint-bar');
-    $('hint-text').textContent = '💡 ' + text;
-    bar.classList.remove('hidden');
-    if (hintTimer) clearTimeout(hintTimer);
-    hintDeadline = performance.now() + HINT_MS;
-    hintTimer = setTimeout(function () { bar.classList.add('hidden'); hintTimer = null; }, HINT_MS);
-  }
-
-  function hideHint() {
-    if (hintTimer) { clearTimeout(hintTimer); hintTimer = null; }
-    parkedHint = null; pendingHint = null;
-    $('hint-bar').classList.add('hidden');
-  }
-
-  function parkHint() {
-    if (hintTimer) { clearTimeout(hintTimer); hintTimer = null; }
-    var bar = $('hint-bar');
-    if (!bar.classList.contains('hidden')) {
-      // Keep the original deadline: the hint's lifetime keeps running
-      // while it is parked behind toasts (see restoreHint).
-      if (hintDeadline - performance.now() > 0) {
-        parkedHint = { text: $('hint-text').textContent.replace('💡 ', ''), deadline: hintDeadline };
+  function updateHUD(state) {
+    state = state || SA.state || {};
+    var matchElement = byId('hud-match');
+    var movesElement = byId('hud-moves');
+    var timeElement = byId('hud-time');
+    if (matchElement) { matchElement.textContent = formatPercent(state.match); }
+    if (movesElement) { movesElement.textContent = String(state.moves || 0); }
+    if (timeElement) {
+      var seconds = state.elapsedSeconds;
+      if (typeof seconds !== 'number' && typeof state.elapsedMs === 'number') {
+        seconds = state.elapsedMs / 1000;
       }
+      timeElement.textContent = formatTime(seconds);
     }
-    bar.classList.add('hidden');
+    updateMusicButton(state);
   }
 
-  function restoreHint() {
-    if (pendingHint) {
-      var t = pendingHint.text; pendingHint = null; parkedHint = null;
-      showHint(t); // full 6 s — a pending hint never started its clock
-      return true;
+  function updateHUDNumbers(match, moves, elapsedSeconds) {
+    updateHUD({ match: match, moves: moves, elapsedSeconds: elapsedSeconds });
+  }
+
+  function updateMusicButton(state) {
+    var button = byId('hud-music');
+    if (!button) { return; }
+    var enabled = true;
+    if (SA.audio && typeof SA.audio.isMusicEnabled === 'function') {
+      enabled = SA.audio.isMusicEnabled();
+    } else if (typeof state.musicEnabled === 'boolean') {
+      enabled = state.musicEnabled;
     }
-    if (parkedHint) {
-      var p = parkedHint; parkedHint = null;
-      var remaining = Math.max(0, p.deadline - performance.now());
-      if (remaining <= 0) return false; // lifetime expired while parked
-      var bar = $('hint-bar');
-      $('hint-text').textContent = '💡 ' + p.text;
-      bar.classList.remove('hidden');
-      if (hintTimer) clearTimeout(hintTimer);
-      hintDeadline = performance.now() + remaining;
-      hintTimer = setTimeout(function () { bar.classList.add('hidden'); hintTimer = null; }, remaining);
-      return true;
+    button.textContent = enabled ? '♪' : '♪̶';
+    button.setAttribute('aria-pressed', enabled ? 'true' : 'false');
+    button.classList.toggle('muted', !enabled);
+  }
+
+  function hideHUD() {
+    var hud = byId('hud');
+    var restore = byId('hud-restore');
+    if (hud) { hud.hidden = true; hud.classList.add('hidden'); }
+    if (restore) { restore.hidden = false; restore.classList.add('visible'); }
+  }
+
+  function showHUD() {
+    var hud = byId('hud');
+    var restore = byId('hud-restore');
+    if (hud) { hud.hidden = false; hud.classList.remove('hidden'); }
+    if (restore) { restore.hidden = true; restore.classList.remove('visible'); }
+  }
+
+  function toggleHUD() {
+    var hud = byId('hud');
+    if (hud && hud.hidden) { showHUD(); } else { hideHUD(); }
+  }
+
+  function setHudVisible(visible) {
+    if (visible) { showHUD(); } else { hideHUD(); }
+  }
+
+  function setHUDOpacity(value) {
+    var hud = byId('hud');
+    if (!hud) { return; }
+    var opacity = Math.max(0, Math.min(1, Number(value)));
+    hud.style.opacity = String(opacity);
+  }
+
+  // --- toasts ---------------------------------------------------------------
+
+  function showToastNow(item) {
+    var toast = byId('toast');
+    if (!toast) { toastShowing = false; return; }
+    toastShowing = true;
+    toast.textContent = item.message;
+    toast.hidden = false;
+    toast.classList.add('visible');
+    toast.classList.toggle('hint', !!item.isHint);
+    var duration = item.durationMs || (item.isHint ? HINT_TOAST_MS : TOAST_MS);
+    toastTimer = window.setTimeout(function () {
+      toastTimer = null;
+      toast.hidden = true;
+      toast.classList.remove('visible');
+      toastShowing = false;
+      showNextToast();
+    }, duration);
+  }
+
+  function showNextToast() {
+    if (toastShowing || toastQueue.length === 0) { return; }
+    showToastNow(toastQueue.shift());
+  }
+
+  /* options may be { hint: true } or a duration in milliseconds
+   * (the main module passes a number); a hint toast stays six
+   * seconds, other toasts about two and six tenths seconds. */
+  function showToast(message, options) {
+    if (!message) { return; }
+    var isHint = !!(options && options.hint);
+    var duration = TOAST_MS;
+    if (typeof options === 'number') { duration = options; }
+    else if (isHint) { duration = HINT_TOAST_MS; }
+    // Queue at most two at a time: a third toast replaces the oldest queued
+    // one rather than growing the queue.
+    if (toastQueue.length >= MAX_TOAST_QUEUE) { toastQueue.shift(); }
+    toastQueue.push({ message: String(message), isHint: isHint, durationMs: duration });
+    showNextToast();
+  }
+
+  function showHintToast(message) {
+    showToast(message, { hint: true });
+  }
+
+  function clearToasts() {
+    toastQueue = [];
+    if (toastTimer !== null) {
+      window.clearTimeout(toastTimer);
+      toastTimer = null;
     }
-    return false;
+    var toast = byId('toast');
+    if (toast) {
+      toast.hidden = true;
+      toast.classList.remove('visible');
+    }
+    toastShowing = false;
   }
 
-  function displayToast(msg) {
-    toastActive = true;
-    parkHint();
-    var t = $('toast');
-    t.textContent = msg;
-    t.classList.remove('hidden');
-    if (toastTimer) clearTimeout(toastTimer);
-    toastTimer = setTimeout(endToast, TOAST_MS);
-  }
+  // --- complete screen ------------------------------------------------------
 
-  function endToast() {
-    if (toastTimer) { clearTimeout(toastTimer); toastTimer = null; }
-    $('toast').classList.add('hidden');
-    toastActive = false;
-    if (toastQueue.length) { displayToast(toastQueue.shift()); return; }
-    restoreHint();
-  }
-
-  function toast(msg) {
-    if (toastActive) {
-      if ($('toast').textContent === msg) return; // duplicate of the one showing
-      if (toastQueue.length < TOAST_QUEUE_MAX && toastQueue[toastQueue.length - 1] !== msg) {
-        toastQueue.push(msg);
+  function showCompleteResult(result) {
+    result = result || {};
+    var starsElement = byId('complete-stars');
+    var matchElement = byId('complete-match');
+    var timeElement = byId('complete-time');
+    var movesElement = byId('complete-moves');
+    var bestElement = byId('complete-best');
+    var criteriaElement = byId('complete-criteria');
+    if (starsElement) {
+      var stars = result.stars || 1;
+      starsElement.textContent = '★'.repeat(stars) + '☆'.repeat(3 - stars);
+    }
+    if (matchElement) { matchElement.textContent = formatPercent(result.match); }
+    if (timeElement) {
+      var seconds = result.elapsedSeconds;
+      if (typeof seconds !== 'number' && typeof result.timeMs === 'number') {
+        seconds = result.timeMs / 1000;
       }
+      timeElement.textContent = formatTime(seconds);
+    }
+    if (movesElement) { movesElement.textContent = String(result.moves || 0); }
+    if (bestElement) {
+      bestElement.textContent = result.isNewBest ? 'New best score' : '';
+      bestElement.hidden = !result.isNewBest;
+    }
+    if (criteriaElement) {
+      criteriaElement.textContent = '3 stars: 25 moves, 120 seconds, 95% match, 1 hint. ' +
+        '2 stars: 40 moves, 240 seconds, 90% match, 3 hints.';
+    }
+    return showComplete();
+  }
+
+  // --- settings wiring ------------------------------------------------------
+
+  function applySettings(settings) {
+    settings = settings || {};
+    if (typeof settings.musicVolume === 'number' && SA.audio &&
+        typeof SA.audio.setMusicVolume === 'function') {
+      SA.audio.setMusicVolume(settings.musicVolume);
+    }
+    if (typeof settings.hudOpacity === 'number') { setHUDOpacity(settings.hudOpacity); }
+    var volumeSlider = byId('settings-volume');
+    var opacitySlider = byId('settings-opacity');
+    var musicToggle = byId('settings-music-toggle');
+    if (volumeSlider && typeof settings.musicVolume === 'number') {
+      volumeSlider.value = String(Math.round(settings.musicVolume * 100));
+    }
+    if (opacitySlider && typeof settings.hudOpacity === 'number') {
+      opacitySlider.value = String(Math.round(settings.hudOpacity * 100));
+    }
+    if (musicToggle && typeof settings.musicEnabled === 'boolean') {
+      musicToggle.checked = settings.musicEnabled;
+    }
+  }
+
+  function wireSettings(state) {
+    state = state || SA.state || {};
+    var volumeSlider = byId('settings-volume');
+    var opacitySlider = byId('settings-opacity');
+    var musicToggle = byId('settings-music-toggle');
+
+    if (volumeSlider) {
+      volumeSlider.addEventListener('input', function () {
+        var volume = Number(volumeSlider.value) / 100;
+        state.musicVolume = volume;
+        if (SA.audio && typeof SA.audio.setMusicVolume === 'function') {
+          SA.audio.setMusicVolume(volume);
+        }
+      });
+    }
+    if (opacitySlider) {
+      opacitySlider.addEventListener('input', function () {
+        var opacity = Number(opacitySlider.value) / 100;
+        state.hudOpacity = opacity;
+        setHUDOpacity(opacity);
+      });
+    }
+    if (musicToggle) {
+      musicToggle.addEventListener('change', function () {
+        state.musicEnabled = !!musicToggle.checked;
+        if (SA.audio) {
+          if (musicToggle.checked && typeof SA.audio.startMusic === 'function') {
+            SA.audio.startMusic();
+          } else if (!musicToggle.checked && typeof SA.audio.stopMusic === 'function') {
+            SA.audio.stopMusic();
+          }
+        }
+        updateMusicButton(state);
+      });
+    }
+  }
+
+  // --- pause toggle (used by the Escape key path) ---------------------------
+
+  function togglePause() {
+    if (SA.main && typeof SA.main.togglePause === 'function') {
+      SA.main.togglePause();
       return;
     }
-    displayToast(msg);
+    var pauseScreen = byId('screen-pause');
+    if (pauseScreen && !pauseScreen.hidden) { showGame(); } else { showPause(); }
   }
 
-  function hideToast() {
-    if (toastActive) endToast(); // tap dismiss; a queued toast / parked hint follows
-  }
+  // --- one-time wiring of the static controls -------------------------------
 
-  function clearNotifications() {
-    if (toastTimer) { clearTimeout(toastTimer); toastTimer = null; }
-    if (hintTimer) { clearTimeout(hintTimer); hintTimer = null; }
-    toastQueue.length = 0; toastActive = false;
-    parkedHint = null; pendingHint = null;
-    $('toast').classList.add('hidden');
-    $('hint-bar').classList.add('hidden');
-  }
+  function wire(state) {
+    if (wired) { return; }
+    wired = true;
+    state = state || SA.state || {};
 
-  function notifyState() {
-    var hintMs = 0;
-    if (!$('hint-bar').classList.contains('hidden')) {
-      hintMs = Math.max(0, hintDeadline - performance.now());
-    } else if (parkedHint) {
-      hintMs = Math.max(0, parkedHint.deadline - performance.now());
+    var versionLabel = byId('version-label');
+    if (versionLabel) { versionLabel.textContent = '1.0'; }
+
+    function onClick(id, handler) {
+      var element = byId(id);
+      if (!element) { return; }
+      element.addEventListener('click', function (event) {
+        event.preventDefault();
+        if (SA.audio && typeof SA.audio.playClick === 'function') { SA.audio.playClick(); }
+        handler();
+      });
     }
-    return {
-      toast: toastActive,
-      hint: !$('hint-bar').classList.contains('hidden'),
-      queued: toastQueue.length,
-      parked: !!parkedHint,
-      pending: !!pendingHint,
-      hintMs: Math.round(hintMs)
-    };
+
+    onClick('btn-play', function () {
+      if (SA.main && typeof SA.main.startLevel === 'function') { SA.main.startLevel('level-01'); }
+      else { showGame(); }
+    });
+    onClick('btn-levels', function () { showLevels(); });
+    onClick('btn-settings', function () { showSettings('menu'); });
+    onClick('btn-credits', function () { showCredits(); });
+    onClick('btn-back-levels', function () { showMenu(); });
+    onClick('btn-back-credits', function () { showMenu(); });
+    onClick('btn-back-settings', function () { backFromSettings(); });
+    onClick('level-01-btn', function () {
+      if (SA.main && typeof SA.main.startLevel === 'function') { SA.main.startLevel('level-01'); }
+      else { showGame(); }
+    });
+    onClick('btn-resume', function () {
+      if (SA.main && typeof SA.main.resume === 'function') { SA.main.resume(); }
+      else { showGame(); }
+    });
+    onClick('btn-pause-settings', function () { showSettings('pause'); });
+    onClick('btn-pause-menu', function () {
+      if (SA.main && typeof SA.main.quitToMenu === 'function') { SA.main.quitToMenu(); }
+      else { showMenu(); }
+    });
+    onClick('btn-restart', function () {
+      if (SA.main && typeof SA.main.startLevel === 'function') { SA.main.startLevel('level-01'); }
+      else { showGame(); }
+    });
+    onClick('btn-next-chapter', function () { showChapter2(); });
+    onClick('btn-chapter2-back', function () { showMenu(); });
+
+    onClick('hud-pause', function () {
+      if (SA.main && typeof SA.main.pause === 'function') { SA.main.pause(); }
+      else { showPause(); }
+    });
+    onClick('hud-hint', function () {
+      if (SA.main && typeof SA.main.useHint === 'function') { SA.main.useHint(); }
+    });
+    onClick('hud-music', function () {
+      if (SA.audio && typeof SA.audio.toggleMusic === 'function') {
+        SA.audio.toggleMusic();
+      } else if (SA.audio && typeof SA.audio.isMusicEnabled === 'function') {
+        if (SA.audio.isMusicEnabled()) { SA.audio.stopMusic(); } else { SA.audio.startMusic(); }
+      }
+      updateMusicButton(state);
+    });
+    onClick('hud-settings', function () { showSettings('game'); });
+    onClick('hud-hide', function () { hideHUD(); });
+    onClick('hud-restore', function () { showHUD(); });
+
+    // Locked chapter labels do nothing when tapped, beyond a short note.
+    ['ch2-locked', 'ch3-locked', 'ch4-locked', 'ch5-locked'].forEach(function (id) {
+      onClick(id, function () { showToast('That chapter is locked.'); });
+    });
+
+    wireSettings(state);
   }
 
-  function setHudOpacity(v) {
-    $('hud').style.opacity = v;
-    var o1 = $('hud-opacity'), o2 = $('set-hud-opacity');
-    if (o1 && o1.value !== String(v)) o1.value = v;
-    if (o2 && o2.value !== String(v)) o2.value = v;
-  }
-
-  // HUD title/objective come from the loaded level's data, so a new
-  // level needs no UI code changes.
-  function setLevel(level) {
-    $('hud-title').textContent = level.chapter + ' — ' + level.name;
-    $('hud-objective').textContent = 'Match the shadow to the ivory silhouette on the wall.';
-  }
-
-  function showComplete(result) {
-    $('complete-match').textContent = Math.round(result.match * 100) + '%';
-    $('complete-time').textContent = fmtTime(result.timeMs);
-    $('complete-moves').textContent = String(result.moves);
-    $('complete-stars').textContent = '★'.repeat(result.stars) + '☆'.repeat(3 - result.stars);
-    // Star-criteria line, e.g. "3★: ≤25 moves · ≤120s · ≥95% · ≤1 hint".
-    if ($('complete-criteria')) $('complete-criteria').textContent = result.criteria || '';
-    $('complete-best').textContent = result.isNewBest ? '★ New best score! ★' : bestLabel(game.bestScore);
-  }
-
-  function init(g) {
-    game = g;
-    el = {};
-    // Menu
-    $('menu-play').addEventListener('click', function () { SA.Audio.ensure(); game.startFresh(); });
-    $('menu-continue').addEventListener('click', function () { SA.Audio.ensure(); game.continueGame(); });
-    $('menu-levels').addEventListener('click', function () { game.showScreen('levels'); });
-    $('menu-settings').addEventListener('click', function () { game.showScreen('settings', 'menu'); });
-    $('menu-credits').addEventListener('click', function () { game.showScreen('credits'); });
-    // Level select
-    $('level-1').addEventListener('click', function () { SA.Audio.ensure(); game.startFresh(); });
-    $('levels-back').addEventListener('click', function () { game.showScreen('menu'); });
-    // Settings
-    $('settings-back').addEventListener('click', function () { game.showScreen(game.settingsReturn || 'menu'); });
-    $('set-volume').addEventListener('input', function (e) {
-      game.settings.volume = parseFloat(e.target.value);
-      SA.Audio.setVolume(game.settings.volume);
-      game.saveSettings();
-    });
-    $('set-mute').addEventListener('change', function (e) {
-      game.settings.muted = e.target.checked;
-      SA.Audio.setMuted(game.settings.muted);
-      game.saveSettings();
-    });
-    // Music controls — checkbox + volume slider, persisted in the same
-    // sa-settings-v1 object as volume/mute.
-    $('set-music-on').addEventListener('change', function (e) { setMusicOn(e.target.checked); });
-    $('set-music-volume').addEventListener('input', function (e) {
-      game.settings.musicVolume = parseFloat(e.target.value);
-      SA.Audio.setMusicVolume(game.settings.musicVolume);
-      game.saveSettings();
-    });
-    $('set-hud-opacity').addEventListener('input', function (e) {
-      game.setHudOpacity(parseFloat(e.target.value));
-    });
-    $('set-reset-best').addEventListener('click', function () {
-      game.clearBest();
-      refreshLevelBest();
-      toast('Best score cleared.');
-    });
-    // Replay Tutorial from Settings. In-game (opened from pause) it
-    // resumes into the level with the tutorial; from the menu it starts
-    // Chapter I fresh with the tutorial forced on.
-    $('set-tutorial').addEventListener('click', function () { game.replayTutorialFromSettings(); });
-    // Credits
-    $('credits-back').addEventListener('click', function () { game.showScreen('menu'); });
-    // Pause
-    $('pause-resume').addEventListener('click', function () { game.togglePause(); });
-    $('pause-restart').addEventListener('click', function () { game.resetLevel(); game.resumeFromPause(); });
-    // Replay Tutorial — resume into playing with the tutorial from step 1.
-    $('pause-tutorial').addEventListener('click', function () { game.replayTutorial(); });
-    $('pause-settings').addEventListener('click', function () { game.showScreen('settings', 'pause'); });
-    $('pause-menu').addEventListener('click', function () { game.backToMenu(); });
-    // Complete
-    $('complete-replay').addEventListener('click', function () { game.startFresh(); });
-    // NEXT CHAPTER — locked Chapter II screen (no playable content).
-    $('complete-next').addEventListener('click', function () { game.showScreen('chapter2'); });
-    $('complete-menu').addEventListener('click', function () { game.backToMenu(); });
-    // Chapter II locked screen: back to menu, or replay Chapter I.
-    $('chapter2-replay').addEventListener('click', function () { game.startFresh(); });
-    $('chapter2-menu').addEventListener('click', function () { game.backToMenu(); });
-    // HUD
-    $('btn-hint').addEventListener('click', function () { game.nextHint(); });
-    $('btn-music').addEventListener('click', function () { setMusicOn(!game.settings.musicOn); });
-    $('btn-reset').addEventListener('click', function () { game.resetLevel(); });
-    $('btn-pause').addEventListener('click', function () { game.togglePause(); });
-    $('btn-full').addEventListener('click', function () { game.toggleFullscreen(); });
-    // Desktop Reset View — same action as the mobile bar's zoom button.
-    $('btn-view').addEventListener('click', function () { game.resetZoom(); toast('Zoom reset.'); });
-    $('btn-hidehud').addEventListener('click', function () { game.setHudHidden(true); });
-    $('hud-restore').addEventListener('click', function () { game.setHudHidden(false); });
-    $('hud-opacity').addEventListener('input', function (e) { game.setHudOpacity(parseFloat(e.target.value)); });
-    // Hint bar + toast dismiss on tap; the hint also has a close button.
-    $('hint-bar').addEventListener('click', function () { hideHint(); });
-    $('hint-close').addEventListener('click', function (e) { e.stopPropagation(); hideHint(); });
-    $('toast').addEventListener('click', function () { hideToast(); });
-    // Mobile bar
-    $('btn-rot-l').addEventListener('click', function () { game.rotateSelected(-15); });
-    $('btn-rot-r').addEventListener('click', function () { game.rotateSelected(15); });
-    $('btn-m-hint').addEventListener('click', function () { game.nextHint(); });
-    $('btn-m-reset').addEventListener('click', function () { game.resetLevel(); });
-    $('btn-m-pause').addEventListener('click', function () { game.togglePause(); });
-    $('btn-m-zoom').addEventListener('click', function () { game.resetZoom(); toast('Zoom reset.'); });
-
-    // Apply persisted settings to the controls.
-    $('set-volume').value = game.settings.volume;
-    $('set-mute').checked = game.settings.muted;
-    $('set-music-on').checked = game.settings.musicOn;
-    $('set-music-volume').value = game.settings.musicVolume;
-    refreshMusicBtn();
-    $('set-hud-opacity').value = game.settings.hudOpacity;
-    $('hud-opacity').value = game.settings.hudOpacity;
-    setHudOpacity(game.settings.hudOpacity);
-    refreshLevelBest();
-  }
-
-  return {
-    init: init, showScreen: showScreen, updateHUD: updateHUD,
-    showHint: showHint, hideHint: hideHint, toast: toast, hideToast: hideToast,
-    clearNotifications: clearNotifications, notifyState: notifyState,
-    setHudOpacity: setHudOpacity, setLevel: setLevel,
-    showComplete: showComplete, refreshLevelBest: refreshLevelBest,
-    fmtTime: fmtTime
+  SA.ui = {
+    showScreen: showScreen,
+    showMenu: showMenu,
+    showLevels: showLevels,
+    showSettings: showSettings,
+    showCredits: showCredits,
+    showGame: showGame,
+    showPause: showPause,
+    showComplete: showComplete,
+    showChapter2: showChapter2,
+    showCompleteResult: showCompleteResult,
+    updateHUD: updateHUD,
+    updateHUDNumbers: updateHUDNumbers,
+    showToast: showToast,
+    showHintToast: showHintToast,
+    clearToasts: clearToasts,
+    hideHUD: hideHUD,
+    showHUD: showHUD,
+    toggleHUD: toggleHUD,
+    setHudVisible: setHudVisible,
+    setHUDOpacity: setHUDOpacity,
+    applySettings: applySettings,
+    wireSettings: wireSettings,
+    togglePause: togglePause,
+    backFromSettings: backFromSettings,
+    formatTime: formatTime,
+    formatPercent: formatPercent,
+    wire: wire
   };
 })();

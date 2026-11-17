@@ -1,311 +1,201 @@
-/* SHADOW ARCHITECT — stylesheet.
-   Visual system: midnight blue + obsidian ground, violet accents, ivory
-   text, cyan interaction colour, amber for light and rewards. Panels
-   are glassy dark cards; the HUD is a minimal top strip; touch targets
-   stay at least 44px. Organised top-down: reset, app shell, screens,
-   menu, level select, settings, HUD, hint/toast, mobile bar, complete
-   screen, tutorial, then responsive rules. */
-
-* { box-sizing: border-box; margin: 0; padding: 0; }
-html, body { height: 100%; overflow: hidden; background: #0b1026; }
-body {
-  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-  color: #f2ead8;
-  -webkit-user-select: none; user-select: none;
-  -webkit-tap-highlight-color: transparent;
-}
-#app { position: fixed; inset: 0; overflow: hidden; }
-#game {
-  position: absolute; inset: 0; width: 100%; height: 100%;
-  display: block; touch-action: none; cursor: default;
+/* Shadow Architect — page style. Palette from the specification. */
+:root {
+  --midnight: #0a0e27;
+  --obsidian: #05070f;
+  --violet: #9d8df1;
+  --ivory: #f2ead8;
+  --cyan: #6fd3e7;
+  --amber: #f2b544;
+  --hud-opacity: 0.9;
 }
 
-.hidden { display: none !important; }
+* { box-sizing: border-box; }
 
-/* ---------- Full-screen overlays ---------- */
+html, body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  background: var(--obsidian);
+  color: var(--ivory);
+  font-family: system-ui, sans-serif;
+  overflow: hidden;
+}
+
+#app { height: 100%; }
+
 .screen {
-  position: absolute; inset: 0; z-index: 20;
-  display: flex; align-items: center; justify-content: center;
-  background: rgba(8, 10, 24, 0.55);
-  backdrop-filter: blur(2px);
-  opacity: 1; transition: opacity 0.35s ease;
-}
-.screen.fading { opacity: 0; pointer-events: none; }
-
-.panel {
-  background: rgba(13, 15, 26, 0.92);
-  border: 1px solid rgba(157, 141, 241, 0.35);
-  border-radius: 16px;
-  padding: 28px 34px;
-  max-width: min(560px, 92vw);
-  max-height: 92vh; overflow-y: auto;
+  min-height: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  padding: 20px;
   text-align: center;
-  box-shadow: 0 18px 60px rgba(0, 0, 0, 0.6);
-  animation: rise 0.45s ease;
+  background: linear-gradient(180deg, var(--midnight) 0%, var(--obsidian) 100%);
 }
-@keyframes rise { from { transform: translateY(14px); opacity: 0; } to { transform: none; opacity: 1; } }
-.panel h2 {
-  font-family: Georgia, "Palatino Linotype", serif;
-  letter-spacing: 0.14em; font-size: 22px;
-  margin-bottom: 14px; color: #f2ead8;
-}
-.panel p { color: #c9cde0; font-size: 14px; line-height: 1.6; margin: 8px 0; }
-.fineprint { font-size: 12px; color: #8b93b8; line-height: 1.5; }
 
-/* ---------- Menu ---------- */
-.menu-panel { background: rgba(13, 15, 26, 0.78); border-color: rgba(111, 211, 231, 0.25); }
-.menu-kicker { letter-spacing: 0.42em; font-size: 11px; color: #6fd3e7; margin-bottom: 10px; }
+.screen[hidden] { display: none; }
+
 .game-title {
-  font-family: Georgia, "Palatino Linotype", serif;
-  font-size: clamp(40px, 8vw, 64px); line-height: 0.95; letter-spacing: 0.08em;
-  color: #f2ead8;
-  text-shadow: 0 0 26px rgba(157, 141, 241, 0.55), 0 2px 0 rgba(0, 0, 0, 0.4);
-}
-.tagline { margin: 12px 0 22px; font-style: italic; color: #e8b25c; font-size: 15px; letter-spacing: 0.04em; }
-.menu-buttons { display: flex; flex-direction: column; gap: 9px; align-items: center; }
-.menu-btn {
-  font: 600 14px system-ui, sans-serif; letter-spacing: 0.12em;
-  color: #f2ead8; background: rgba(44, 52, 100, 0.55);
-  border: 1px solid rgba(157, 141, 241, 0.45);
-  border-radius: 10px; padding: 11px 26px; min-width: 240px;
-  cursor: pointer; transition: background 0.18s, transform 0.12s, border-color 0.18s;
-}
-.menu-btn:hover { background: rgba(76, 88, 150, 0.7); border-color: #6fd3e7; transform: translateY(-1px); }
-.menu-btn.primary { background: linear-gradient(135deg, #6d5bd0, #3f6d8e); border-color: #6fd3e7; }
-.menu-btn.primary:hover { background: linear-gradient(135deg, #7d6ce0, #4a7ea3); }
-.menu-btn.small { min-width: 0; padding: 8px 14px; font-size: 12px; }
-.menu-foot { margin-top: 18px; font-size: 11px; color: #8b93b8; letter-spacing: 0.06em; }
-
-/* ---------- Level select ---------- */
-.level-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin: 12px 0; }
-.level-card {
-  display: flex; flex-direction: column; gap: 4px; text-align: left;
-  background: rgba(26, 31, 56, 0.8); border: 1px solid rgba(157, 141, 241, 0.3);
-  border-radius: 10px; padding: 12px 14px; color: #f2ead8; font-family: inherit;
-}
-.level-card.playable { cursor: pointer; border-color: rgba(111, 211, 231, 0.6); }
-.level-card.playable:hover { background: rgba(44, 52, 100, 0.8); }
-.level-card.locked { opacity: 0.45; }
-.level-ch { font-size: 11px; letter-spacing: 0.2em; color: #6fd3e7; }
-.level-name { font-family: Georgia, serif; font-size: 16px; }
-.level-state { font-size: 12px; color: #c9cde0; }
-.level-best { font-size: 11px; color: #e8b25c; }
-
-/* ---------- Settings ---------- */
-.setting-row {
-  display: flex; align-items: center; justify-content: space-between; gap: 14px;
-  padding: 10px 0; font-size: 14px; color: #c9cde0;
-  border-bottom: 1px solid rgba(157, 141, 241, 0.15);
-}
-.setting-row input[type="range"] { width: 180px; accent-color: #6fd3e7; }
-.setting-row input[type="checkbox"] { accent-color: #6fd3e7; width: 18px; height: 18px; }
-
-/* ---------- HUD ---------- */
-#hud {
-  position: absolute; top: 0; left: 0; right: 0; z-index: 10;
-  display: flex; align-items: flex-start; justify-content: space-between; gap: 10px;
-  padding: 10px 14px;
-  background: linear-gradient(rgba(8, 10, 24, 0.72), rgba(8, 10, 24, 0));
-  transition: opacity 0.3s ease;
-  pointer-events: none;
-}
-#hud > * { pointer-events: auto; }
-.hud-title { font-family: Georgia, serif; font-size: 15px; letter-spacing: 0.1em; color: #f2ead8; }
-.hud-objective { font-size: 12px; color: #c9cde0; margin-top: 2px; max-width: 300px; line-height: 1.35; }
-.hud-mid { text-align: center; }
-.hud-match { font-size: 22px; font-weight: 700; color: #6fd3e7; }
-.hud-match-label { display: block; font-size: 10px; letter-spacing: 0.18em; color: #8b93b8; font-weight: 400; }
-.hud-match.good { color: #e8b25c; }
-/* "Almost there" (85–89% match): the number pulses amber so the player
-   knows one nudge may finish the level. Pure CSS, no layout change. */
-.hud-match.almost { color: #e8b25c; animation: almostPulse 1.1s ease-in-out infinite; }
-.hud-match.almost .hud-match-label { color: #e8b25c; }
-@keyframes almostPulse {
-  0%, 100% { opacity: 1; text-shadow: 0 0 0 rgba(232, 178, 92, 0); }
-  50% { opacity: 0.75; text-shadow: 0 0 14px rgba(232, 178, 92, 0.8); }
-}
-.hud-stats { font-size: 12px; color: #c9cde0; margin-top: 2px; }
-.hud-right { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
-.hud-btn {
-  font: 600 12px system-ui, sans-serif; color: #f2ead8;
-  background: rgba(13, 15, 26, 0.75); border: 1px solid rgba(157, 141, 241, 0.4);
-  border-radius: 8px; padding: 7px 10px; cursor: pointer;
-}
-.hud-btn:hover { border-color: #6fd3e7; }
-.hud-btn.off { opacity: 0.55; } /* music toggle off-state reads at a glance */
-.hud-btn-icon { padding: 7px 9px; } /* compact Reset View button */
-.hud-opacity { display: flex; align-items: center; gap: 5px; font-size: 11px; color: #8b93b8; }
-.hud-opacity input { width: 64px; accent-color: #6fd3e7; }
-#hud-restore {
-  position: absolute; right: 14px; bottom: 14px; z-index: 11;
-  font: 600 13px system-ui, sans-serif; color: #f2ead8;
-  background: rgba(13, 15, 26, 0.85); border: 1px solid rgba(111, 211, 231, 0.6);
-  border-radius: 999px; padding: 10px 16px; cursor: pointer;
-  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.5);
+  font-size: 2.2rem;
+  letter-spacing: 0.12em;
+  color: var(--ivory);
+  margin: 0;
 }
 
-/* ---------- Hint bar + toast ----------
-   The two share ONE slot just below the HUD (top: 92px desktop),
-   time-shared — never visible at the same time. A toast takes priority
-   for a few seconds; a visible hint is parked and restored after the
-   toast hides; a hint requested during a toast waits; toasts queue one
-   at a time (see SA.UI). The safe strip below the HUD fits exactly one
-   pill in every viewport, so sharing the slot in time is what
-   guarantees zero overlap. Both dismiss on tap; the hint also has a ×. */
-#hint-bar {
-  position: absolute; left: 50%; top: 92px; transform: translateX(-50%); z-index: 10;
-  background: rgba(13, 15, 26, 0.88); border: 1px solid rgba(232, 178, 92, 0.5);
-  border-radius: 10px; padding: 10px 16px; max-width: min(520px, 88vw);
-  font-size: 13px; line-height: 1.5; color: #f2ead8; text-align: center;
-  transition: opacity 0.3s ease; cursor: pointer;
-}
-/* The × floats right of the first line only, so it costs no width on
-   the wrapped lines below. */
-#hint-close {
-  float: right;
-  background: none; border: none; color: #e8b25c;
-  font-size: 16px; line-height: 1; cursor: pointer; padding: 0 0 2px 8px; margin-top: -2px;
-}
-#toast {
-  position: absolute; left: 50%; top: 92px; transform: translateX(-50%); z-index: 30;
-  background: rgba(13, 15, 26, 0.9); border: 1px solid rgba(111, 211, 231, 0.5);
-  border-radius: 8px; padding: 8px 14px; font-size: 13px; color: #f2ead8;
-  transition: opacity 0.3s ease; cursor: pointer;
+.tagline {
+  color: var(--violet);
+  font-style: italic;
+  margin: 0 0 12px;
 }
 
-/* ---------- Mobile touch bar ---------- */
-#mobile-bar {
-  position: absolute; left: 50%; bottom: 12px; transform: translateX(-50%); z-index: 10;
-  display: flex; gap: 10px;
+.version { color: var(--cyan); opacity: 0.8; }
+
+.menu-buttons, .level-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  width: min(320px, 90vw);
 }
-.m-btn {
-  width: 52px; height: 52px; border-radius: 50%;
-  font-size: 20px; color: #f2ead8;
-  background: rgba(13, 15, 26, 0.8); border: 1px solid rgba(111, 211, 231, 0.55);
+
+.locked-label {
+  color: var(--ivory);
+  opacity: 0.45;
+  margin: 4px 0;
+}
+
+button {
+  min-height: 44px;
+  min-width: 44px;
+  padding: 10px 18px;
+  border: 1px solid var(--violet);
+  border-radius: 8px;
+  background: rgba(157, 141, 241, 0.15);
+  color: var(--ivory);
+  font-size: 1rem;
   cursor: pointer;
 }
-.m-btn:active { background: rgba(76, 88, 150, 0.8); }
 
-/* ---------- Level complete ---------- */
-.complete-kicker { letter-spacing: 0.35em; font-size: 11px; color: #e8b25c; margin-bottom: 6px; }
-.complete-panel { animation: rise 0.45s ease, glow 1.6s ease-in-out infinite alternate; }
-@keyframes glow { from { box-shadow: 0 0 24px rgba(232, 178, 92, 0.25); } to { box-shadow: 0 0 54px rgba(232, 178, 92, 0.55); } }
-.stars { font-size: 34px; color: #e8b25c; letter-spacing: 6px; margin: 8px 0; text-shadow: 0 0 18px rgba(232, 178, 92, 0.7); }
-.complete-criteria { font-size: 12px; color: #8b93b8; margin: 0 0 2px; min-height: 16px; }
-.complete-stats { display: flex; justify-content: center; gap: 28px; margin: 10px 0 4px; }
-.complete-stats div { display: flex; flex-direction: column; gap: 2px; }
-.complete-stats span { font-size: 11px; letter-spacing: 0.16em; color: #8b93b8; }
-.complete-stats strong { font-size: 20px; color: #f2ead8; }
-.complete-best { font-size: 13px; color: #e8b25c; margin: 6px 0 14px; min-height: 18px; }
+button:hover, button:focus-visible {
+  background: rgba(157, 141, 241, 0.35);
+  outline: 2px solid var(--cyan);
+  outline-offset: 2px;
+}
 
-/* ---------- Chapter II locked teaser ---------- */
-.chapter2-lock { font-size: 40px; margin: 10px 0 2px; }
-.coming-soon { letter-spacing: 0.35em; font-size: 13px; color: #6fd3e7; margin: 4px 0 10px; }
+input[type="range"] { width: min(320px, 90vw); accent-color: var(--cyan); }
+input[type="checkbox"] { width: 24px; height: 24px; accent-color: var(--cyan); }
 
-/* ---------- Tutorial ----------
-   The overlay never eats input: rings and card text are
-   pointer-events:none; only the Next/Skip buttons are clickable, so a
-   drag that starts under the card still reaches the canvas. */
-#tutorial { position: absolute; inset: 0; z-index: 15; pointer-events: none; }
-#tut-rings { position: absolute; inset: 0; }
-.tut-ring {
-  position: absolute; border: 3px solid #6fd3e7; border-radius: 50%;
-  box-shadow: 0 0 18px rgba(111, 211, 231, 0.75), inset 0 0 18px rgba(111, 211, 231, 0.25);
-  animation: tutPulse 1.2s ease-in-out infinite;
+/* Playing screen: canvas fills the space below the HUD. */
+#screen-game {
+  padding: 0;
+  justify-content: flex-start;
+  align-items: stretch;
+  position: relative;
 }
-.tut-ring-rect { border-radius: 14px; }
-@keyframes tutPulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.55; } }
-#tut-card {
-  position: absolute; left: 50%; transform: translateX(-50%); bottom: 88px;
-  width: min(520px, 92vw);
-  background: rgba(13, 15, 26, 0.93); border: 1px solid rgba(111, 211, 231, 0.55);
-  border-radius: 12px; padding: 12px 16px; text-align: center;
-  box-shadow: 0 10px 36px rgba(0, 0, 0, 0.6);
-  pointer-events: none;
-}
-#tut-step-label { font-size: 10px; letter-spacing: 0.22em; color: #6fd3e7; margin-bottom: 5px; }
-#tut-text { font-size: 14px; line-height: 1.5; color: #f2ead8; }
-#tut-actions { display: flex; gap: 10px; justify-content: center; margin-top: 10px; pointer-events: auto; }
-.tut-btn {
-  font: 600 13px system-ui, sans-serif; letter-spacing: 0.06em;
-  color: #f2ead8; background: rgba(44, 52, 100, 0.6);
-  border: 1px solid rgba(157, 141, 241, 0.45);
-  border-radius: 8px; padding: 8px 18px; cursor: pointer;
-}
-.tut-btn.primary { background: linear-gradient(135deg, #6d5bd0, #3f6d8e); border-color: #6fd3e7; }
-.tut-btn:hover { border-color: #6fd3e7; }
-/* The rotate step needs the ◀ ▶ buttons even on desktop-width layouts,
-   so the bar is forced visible while that step is up. */
-#app.tut-show-rot #mobile-bar:not(.hidden) { display: flex !important; }
 
-/* ---------- Responsive ---------- */
-@media (max-width: 760px) {
-  .hud-objective { display: none; }
-  .hud-title { font-size: 13px; max-width: 110px; }
-  .hud-match { font-size: 18px; }
-  /* Top-HUD buttons move to the touch bar on small screens — the top
-     row keeps only title + match + stats so nothing wraps or overlaps.
-     Reset View and the music toggle live in the touch bar / Settings
-     instead on small screens. */
-  #btn-hint, #btn-reset, #btn-pause, #btn-full, #btn-view, #btn-hidehud, #btn-music { display: none; }
-  .hud-opacity { display: none; }
-  #mobile-bar { display: flex; }
-  .panel { padding: 20px 18px; }
-  .level-grid { grid-template-columns: 1fr; }
-  .menu-btn { min-width: 200px; }
-  /* On small screens the HUD is ~79px tall and the light fixture sits
-     just below it, so a centred pill would cover the fixture. The
-     toast/hint dock to a top corner, narrow (148px), below the HUD —
-     they only ever cover empty light-cone, never the fixture, stage,
-     wall or touch bar. Which corner depends on orientation: portrait
-     docks right (clears the triangle, whose start position pokes above
-     the stage top on the left); landscape docks left (clears the wall
-     panel on the right). The floating HUD-restore button takes the
-     opposite corner — it used to sit on the touch bar. */
-  #toast, #hint-bar {
-    transform: none; top: 84px;
-    max-width: 148px; font-size: 12px; line-height: 1.4; text-align: left; padding: 7px 10px;
-  }
-  #hint-bar { padding-right: 10px; }
-  #hud-restore { top: 86px; bottom: auto; padding: 8px 10px; }
-  #hud-restore-label { display: none; }
+#game-canvas {
+  display: block;
+  flex: 1;
+  width: 100%;
+  height: 100%;
+  touch-action: none;
 }
-@media (max-width: 760px) and (orientation: portrait) {
-  #toast, #hint-bar { left: auto; right: 8px; }
-  #hud-restore { left: 8px; right: auto; }
+
+/* Heads-up display: dark translucent bar with ivory text. */
+#hud {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  background: rgba(5, 7, 15, var(--hud-opacity));
+  color: var(--ivory);
+  border-bottom: 1px solid rgba(242, 234, 216, 0.2);
+  z-index: 5;
 }
-@media (max-width: 760px) and (orientation: landscape) {
-  #toast, #hint-bar { left: 8px; right: auto; top: 80px; }
-  #hud-restore { left: auto; right: 8px; }
+
+#hud[hidden] { display: none; }
+
+.hud-item { margin-right: 6px; white-space: nowrap; }
+.hud-item strong { color: var(--cyan); }
+
+#hud button {
+  min-height: 44px;
+  min-width: 44px;
+  padding: 8px 10px;
+  font-size: 0.9rem;
 }
-@media (max-width: 400px) {
-  .m-btn { width: 44px; height: 44px; font-size: 17px; }
-  #mobile-bar { gap: 7px; }
+
+#hud-restore {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  z-index: 6;
 }
+
+#hud-restore[hidden] { display: none; }
+
+.mobile-bar {
+  display: flex;
+  gap: 10px;
+  justify-content: center;
+  align-items: center;
+  padding: 10px;
+  background: rgba(5, 7, 15, 0.85);
+  border-top: 1px solid rgba(242, 234, 216, 0.2);
+}
+
+.mobile-bar button {
+  min-height: 44px;
+  min-width: 44px;
+  font-size: 1.1rem;
+}
+
+/* Hide the mobile bar ONLY on a wide screen with a fine pointer. */
 @media (min-width: 761px) and (pointer: fine) {
-  /* v0.7.1 rotation fix (owner-chosen, Option A): hide the touch bar
-     only when the primary pointer is fine (mouse/trackpad desktop).
-     Touch phones report pointer:coarse, so in touch-landscape the
-     ◀ ▶ buttons stay visible and rotation stays possible there. A
-     width-only rule hid the bar on every wide viewport — including a
-     phone held sideways — where the wheel/keys rotate paths have no
-     touch equivalent. Desktop layout is unchanged. */
   #mobile-bar { display: none; }
 }
-@media (max-height: 500px) {
-  .game-title { font-size: 36px; }
-  .menu-btn { padding: 8px 20px; }
-  .panel { padding: 16px 22px; }
+
+.toast {
+  position: absolute;
+  left: 50%;
+  bottom: 76px;
+  transform: translateX(-50%);
+  max-width: 90vw;
+  padding: 10px 16px;
+  border-radius: 8px;
+  background: rgba(5, 7, 15, 0.92);
+  color: var(--ivory);
+  border: 1px solid var(--cyan);
+  z-index: 7;
+  pointer-events: none;
 }
-/* Short-landscape tutorial card: at widths >= 761px the touch bar is
-   hidden (desktop layout) but the viewport is only ~390px tall, so the
-   centred 520px card would cover all three start objects, the light
-   and part of the wall. Dock the card bottom-left, 340px wide, and
-   dock the touch bar below the HUD/toast zone (top: 150px) for the
-   whole tutorial run (tut-active, set by the tutorial module), so it
-   clears the card, the objects and the wall in every step. Portrait
-   and desktop are unaffected (needs height <= 500 AND width >= 761). */
-@media (max-height: 500px) and (min-width: 761px) {
-  #tut-card { left: 8px; transform: none; width: 340px; bottom: 8px; }
-  #app.tut-active #mobile-bar:not(.hidden) { bottom: auto; top: 150px; }
+
+.toast:empty { display: none; }
+
+.tutorial-overlay {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  width: min(420px, 92vw);
+  padding: 20px;
+  border-radius: 12px;
+  background: rgba(5, 7, 15, 0.96);
+  color: var(--ivory);
+  border: 1px solid var(--violet);
+  z-index: 8;
+  text-align: center;
+}
+
+.tutorial-overlay[hidden] { display: none; }
+
+.complete-stars { font-size: 2rem; letter-spacing: 0.2em; color: var(--amber); }
+.complete-best { color: var(--amber); font-weight: bold; }
+.complete-criteria { opacity: 0.85; font-size: 0.9rem; }
+
+/* Touch layouts: buttons are at least 44 by 44 pixels. */
+@media (pointer: coarse) {
+  button { min-height: 44px; min-width: 44px; }
 }

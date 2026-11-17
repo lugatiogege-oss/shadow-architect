@@ -1,167 +1,269 @@
-/* SHADOW ARCHITECT — point-light shadow math (pure, no DOM).
-   A point light shines past each polygon vertex onto a wall line.
-   The ray from the light through a vertex meets the wall at one
-   "along-wall" coordinate; an object's shadow is the span between
-   its lowest and highest projected vertices. The whole scene's
-   shadow is the union of the objects' spans, and the match score
-   is the intersection-over-union of that shadow against the
-   target silhouette bands.
-   Works in the browser as SA.Math and under Node as module.exports.
-   Landscape: wall is a vertical line x = wall, spans run along y.
-   Portrait:  wall is a horizontal line y = wall, spans run along x.
-*/
-var SA = (typeof SA !== 'undefined') ? SA : {};
-SA.Math = (function () {
+/* Shadow Architect — geometry.
+ *
+ * Pure board mathematics only: no screen, no storage, no network.
+ * All angles are in degrees, all lengths in world units.
+ * A point is { x, y }. An interval is [low, high] with low <= high.
+ * An orientation is the string 'landscape' or 'portrait'.
+ */
+(function (root) {
   'use strict';
 
-  // Unit-radius vertex templates, counter-clockwise. The ring's hole
-  // is only visual: it never changes the projected interval.
-  var SHAPES = {
-    triangle: { verts: [[0, -1], [0.866, 0.5], [-0.866, 0.5]], hole: 0 },
-    ring: { verts: regularVerts(12, -Math.PI / 2), hole: 0.53 },
-    hexagon: { verts: regularVerts(6, 0), hole: 0 }
+  var SA = root.SA || (root.SA = {});
+
+  /* Board size by orientation (spec section 2). */
+  var BOARD = {
+    landscape: { width: 1280, height: 720 },
+    portrait: { width: 720, height: 1280 }
   };
 
-  function regularVerts(n, startAngle) {
-    var out = [];
-    for (var i = 0; i < n; i++) {
-      var a = startAngle + (i / n) * Math.PI * 2;
-      out.push([Math.cos(a), Math.sin(a)]);
-    }
-    return out;
+  /* Wall plane by orientation: the coordinate of the wall face the
+   * play area looks at, and the wall thickness. */
+  var WALL = {
+    landscape: { position: 1080, thickness: 64, axis: 'x' },
+    portrait: { position: 1010, thickness: 64, axis: 'y' }
+  };
+
+  var WIN_THRESHOLD = 0.9;
+  var BAND_MATCH_THRESHOLD = 0.85;
+  var RING_INNER_RATIO = 0.53;
+
+  function isFiniteNumber(v) {
+    return typeof v === 'number' && isFinite(v);
   }
 
-  // Rotate + scale a shape's template and move it to the object's
-  // centre, giving world-space vertices for {shape, cx, cy, r, rotDeg}.
-  function worldVertices(obj) {
-    var def = SHAPES[obj.shape];
-    var rad = (obj.rotDeg || 0) * Math.PI / 180;
-    var c = Math.cos(rad), s = Math.sin(rad);
-    var out = [];
-    for (var i = 0; i < def.verts.length; i++) {
-      var lx = def.verts[i][0] * obj.r, ly = def.verts[i][1] * obj.r;
-      out.push({
-        x: obj.cx + lx * c - ly * s,
-        y: obj.cy + lx * s + ly * c
+  function normalOrientation(orientation) {
+    return orientation === 'portrait' ? 'portrait' : 'landscape';
+  }
+
+  function pointOf(value) {
+    if (Array.isArray(value)) {
+      return { x: value[0], y: value[1] };
+    }
+    return { x: value.x, y: value.y };
+  }
+
+  function toRadians(degrees) {
+    return degrees * Math.PI / 180;
+  }
+
+  /* Corner angles (degrees) for each shape kind, relative to rotation.
+   * Triangle: rotation - 90, + 30, + 150.
+   * Hexagon: rotation + 0, 60, 120, 180, 240, 300.
+   * Ring: twelve corners, rotation + 0, 30, ... 330. */
+  function cornerAngles(kind, rotation) {
+    var angles = [];
+    var i;
+    if (kind === 'triangle') {
+      angles = [rotation - 90, rotation + 30, rotation + 150];
+    } else if (kind === 'hexagon') {
+      for (i = 0; i < 6; i++) {
+        angles.push(rotation + i * 60);
+      }
+    } else if (kind === 'ring') {
+      for (i = 0; i < 12; i++) {
+        angles.push(rotation + i * 30);
+      }
+    } else {
+      return null;
+    }
+    return angles;
+  }
+
+  function shapeKind(shape) {
+    if (!shape) return '';
+    var kind = shape.shape || shape.type || shape.kind || '';
+    return String(kind).toLowerCase();
+  }
+
+  /* Corners of a shape: points at distance radius from the centre,
+   * at the corner angles for the shape kind. */
+  function shapeCorners(shape) {
+    var kind = shapeKind(shape);
+    var rotation = isFiniteNumber(shape.rotation) ? shape.rotation : 0;
+    var radius = shape.radius;
+    var angles = cornerAngles(kind, rotation);
+    var corners = [];
+    var i;
+    var a;
+    if (!angles) return corners;
+    for (i = 0; i < angles.length; i++) {
+      a = toRadians(angles[i]);
+      corners.push({
+        x: shape.x + radius * Math.cos(a),
+        y: shape.y + radius * Math.sin(a)
       });
     }
+    return corners;
+  }
+
+  /* Project one point onto the wall along the ray from the light
+   * through the point. Returns the wall coordinate (a number), or
+   * null when the ray is parallel to the wall or runs away from it.
+   * Landscape: the wall is vertical, the result is a wall y.
+   * Portrait: the wall is horizontal, the result is a wall x. */
+  function projectPoint(light, point, orientation) {
+    var o = normalOrientation(orientation);
+    var wallAt = WALL[o].position;
+    var from = pointOf(light);
+    var through = pointOf(point);
+    var t;
+    if (o === 'landscape') {
+      if (through.x === from.x) return null;
+      t = (wallAt - from.x) / (through.x - from.x);
+      if (!(t > 0)) return null;
+      return from.y + t * (through.y - from.y);
+    }
+    if (through.y === from.y) return null;
+    t = (wallAt - from.y) / (through.y - from.y);
+    if (!(t > 0)) return null;
+    return from.x + t * (through.x - from.x);
+  }
+
+  /* Shadow interval of one shape: the smallest and largest wall
+   * coordinate among the projections of its corners. Returns
+   * [low, high], or null when no corner projects onto the wall. */
+  function shadowInterval(shape, light, orientation) {
+    var corners = shapeCorners(shape);
+    var low = Infinity;
+    var high = -Infinity;
+    var i;
+    var projected;
+    for (i = 0; i < corners.length; i++) {
+      projected = projectPoint(light, corners[i], orientation);
+      if (projected === null || !isFiniteNumber(projected)) continue;
+      if (projected < low) low = projected;
+      if (projected > high) high = projected;
+    }
+    if (low === Infinity || high === -Infinity) return null;
+    return [low, high];
+  }
+
+  /* Shadow intervals for a list of shapes, skipping shapes with
+   * no projection. */
+  function shadowIntervals(shapes, light, orientation) {
+    var out = [];
+    var i;
+    var interval;
+    for (i = 0; i < shapes.length; i++) {
+      interval = shadowInterval(shapes[i], light, orientation);
+      if (interval) out.push(interval);
+    }
     return out;
   }
 
-  // Where the ray from light L through vertex V meets the wall line.
-  // Returns the along-wall coordinate, or null when the ray runs
-  // away from the wall (or parallel to it) and never arrives.
-  function projectPoint(L, V, layout) {
-    if (layout.axis === 'x') {
-      var dx = V.x - L.x;
-      if (dx <= 0.001) return null;
-      var t = (layout.wall - L.x) / dx;
-      if (t <= 0) return null;
-      return L.y + t * (V.y - L.y);
-    }
-    var dy = V.y - L.y;
-    if (dy <= 0.001) return null;
-    var t2 = (layout.wall - L.y) / dy;
-    if (t2 <= 0) return null;
-    return L.x + t2 * (V.x - L.x);
+  function intervalOf(value) {
+    if (Array.isArray(value)) return [value[0], value[1]];
+    return [value.low, value.high];
   }
 
-  // One object's shadow on the wall: [min, max] over its projected
-  // vertices, or null when no vertex projects onto the wall.
-  function shadowInterval(obj, light, layout) {
-    var verts = worldVertices(obj);
-    var lo = Infinity, hi = -Infinity, count = 0;
-    for (var i = 0; i < verts.length; i++) {
-      var p = projectPoint(light, verts[i], layout);
-      if (p === null) continue;
-      count++;
-      if (p < lo) lo = p;
-      if (p > hi) hi = p;
-    }
-    return count === 0 ? null : [lo, hi];
-  }
-
-  // Clip an interval to a span; null when nothing survives the clip.
-  function clampInterval(iv, span) {
-    if (!iv) return null;
-    var lo = Math.max(iv[0], span[0]), hi = Math.min(iv[1], span[1]);
-    return hi <= lo ? null : [lo, hi];
-  }
-
-  // Merge a set of intervals (sorted, non-overlapping) and return
-  // the merged list. Null/empty entries are dropped.
+  /* Merge a list of intervals into their union: sort by low end,
+   * then fold together any intervals that overlap or touch.
+   * Null entries are ignored; the result is sorted and disjoint. */
   function mergeIntervals(intervals) {
-    var ivs = [];
-    for (var i = 0; i < intervals.length; i++) {
-      if (intervals[i]) ivs.push(intervals[i].slice());
+    var cleaned = [];
+    var i;
+    var pair;
+    var merged;
+    var last;
+    if (!intervals) return [];
+    for (i = 0; i < intervals.length; i++) {
+      if (!intervals[i]) continue;
+      pair = intervalOf(intervals[i]);
+      if (!isFiniteNumber(pair[0]) || !isFiniteNumber(pair[1])) continue;
+      cleaned.push([Math.min(pair[0], pair[1]), Math.max(pair[0], pair[1])]);
     }
-    if (!ivs.length) return [];
-    ivs.sort(function (a, b) { return a[0] - b[0]; });
-    var merged = [ivs[0]];
-    for (var j = 1; j < ivs.length; j++) {
-      var cur = merged[merged.length - 1];
-      if (ivs[j][0] <= cur[1]) {
-        if (ivs[j][1] > cur[1]) cur[1] = ivs[j][1];
+    cleaned.sort(function (a, b) {
+      if (a[0] !== b[0]) return a[0] - b[0];
+      return a[1] - b[1];
+    });
+    merged = [];
+    for (i = 0; i < cleaned.length; i++) {
+      last = merged[merged.length - 1];
+      if (last && cleaned[i][0] <= last[1]) {
+        if (cleaned[i][1] > last[1]) last[1] = cleaned[i][1];
       } else {
-        merged.push(ivs[j]);
+        merged.push([cleaned[i][0], cleaned[i][1]]);
       }
     }
     return merged;
   }
 
-  // Total length covered by a set of intervals (overlaps counted once).
-  function unionLength(intervals) {
-    var merged = mergeIntervals(intervals);
+  function totalLength(union) {
     var total = 0;
-    for (var i = 0; i < merged.length; i++) total += merged[i][1] - merged[i][0];
+    var i;
+    for (i = 0; i < union.length; i++) {
+      total += Math.max(0, union[i][1] - union[i][0]);
+    }
     return total;
   }
 
-  // Length covered by both interval sets at once (pairwise overlap,
-  // merged so shared ground is counted once).
-  function intersectionLength(a, b) {
-    var inter = [];
-    for (var m = 0; m < a.length; m++) {
-      if (!a[m]) continue;
-      for (var n = 0; n < b.length; n++) {
-        if (!b[n]) continue;
-        var lo = Math.max(a[m][0], b[n][0]);
-        var hi = Math.min(a[m][1], b[n][1]);
-        if (hi > lo) inter.push([lo, hi]);
+  /* Length covered by both unions. */
+  function overlapLength(first, second) {
+    var i = 0;
+    var j = 0;
+    var total = 0;
+    var low;
+    var high;
+    while (i < first.length && j < second.length) {
+      low = Math.max(first[i][0], second[j][0]);
+      high = Math.min(first[i][1], second[j][1]);
+      if (high > low) total += high - low;
+      if (first[i][1] < second[j][1]) i++;
+      else j++;
+    }
+    return total;
+  }
+
+  /* Intersection-over-union of two single intervals. */
+  function intervalIoU(first, second) {
+    var a = intervalOf(first);
+    var b = intervalOf(second);
+    var interLow = Math.max(a[0], b[0]);
+    var interHigh = Math.min(a[1], b[1]);
+    var inter = Math.max(0, interHigh - interLow);
+    var union = Math.max(0, a[1] - a[0]) + Math.max(0, b[1] - b[0]) - inter;
+    if (union <= 0) return 0;
+    return inter / union;
+  }
+
+  /* Match of a shadow union against a target: the overlap length
+   * divided by the length covered by either union. The inputs may
+   * be raw interval lists; each side is merged first. */
+  function matchScore(shadow, target) {
+    var shadowUnion = mergeIntervals(shadow);
+    var targetUnion = mergeIntervals(target);
+    var inter = overlapLength(shadowUnion, targetUnion);
+    var union = totalLength(shadowUnion) + totalLength(targetUnion) - inter;
+    if (union <= 0) return 0;
+    return inter / union;
+  }
+
+  /* Combined match for a set of shapes and a light against target
+   * bands: project every shape, merge, and score against the bands. */
+  function matchForShapes(shapes, light, targetBands, orientation) {
+    var shadows = shadowIntervals(shapes, light, orientation);
+    return matchScore(shadows, targetBands);
+  }
+
+  /* Per-band scores: for each target band, the best interval IoU
+   * among the shadow intervals, one score per band. */
+  function bandScores(shadow, targetBands) {
+    var shadows = [];
+    var i;
+    var j;
+    var score;
+    var best;
+    var out = [];
+    if (shadow) {
+      for (i = 0; i < shadow.length; i++) {
+        if (shadow[i]) shadows.push(intervalOf(shadow[i]));
       }
     }
-    return unionLength(inter);
-  }
-
-  // Overall match 0..1: IoU of the shadow union vs the target union
-  // (shared length divided by combined length). 0 when either side
-  // covers nothing.
-  function matchScore(shadowIntervals, targetIntervals) {
-    var inter = intersectionLength(shadowIntervals, targetIntervals);
-    var uni = unionLength(shadowIntervals.concat(targetIntervals));
-    if (uni <= 0) return 0;
-    return inter / uni;
-  }
-
-  // Per-band score 0..1: for each target band, the best single
-  // object's interval IoU against that band. Deliberately NOT union
-  // coverage: at the level start the triangle and hexagon shadows
-  // together happen to cover band 3 completely while neither fits
-  // it alone (best ~0.69), so union coverage would light the band
-  // before the player has done anything. A band only glows when one
-  // object is really casting (nearly) that silhouette. Callers
-  // treat >= 0.85 as matched.
-  function bandScores(shadowIntervals, targetIntervals) {
-    var out = [];
-    for (var i = 0; i < targetIntervals.length; i++) {
-      var band = targetIntervals[i];
-      var best = 0;
-      for (var j = 0; j < shadowIntervals.length; j++) {
-        var iv = shadowIntervals[j];
-        if (!iv) continue;
-        var inter = Math.max(0, Math.min(iv[1], band[1]) - Math.max(iv[0], band[0]));
-        var uni = Math.max(iv[1], band[1]) - Math.min(iv[0], band[0]);
-        var score = uni <= 0 ? 0 : inter / uni;
+    if (!targetBands) return out;
+    for (i = 0; i < targetBands.length; i++) {
+      best = 0;
+      for (j = 0; j < shadows.length; j++) {
+        score = intervalIoU(shadows[j], targetBands[i]);
         if (score > best) best = score;
       }
       out.push(best);
@@ -169,41 +271,81 @@ SA.Math = (function () {
     return out;
   }
 
-  function dist(x1, y1, x2, y2) {
-    var dx = x2 - x1, dy = y2 - y1;
-    return Math.sqrt(dx * dx + dy * dy);
+  /* Best band score for one shadow interval against one band. */
+  function bandScore(shadow, band) {
+    var shadows = Array.isArray(shadow) && shadow.length > 0 &&
+      typeof shadow[0] === 'number' ? [shadow] : shadow;
+    var scores = bandScores(shadows, [band]);
+    return scores.length ? scores[0] : 0;
   }
 
-  // Ray-cast point-in-polygon, for click/tap selection of objects.
-  function pointInPoly(px, py, verts) {
-    var inside = false;
-    for (var i = 0, j = verts.length - 1; i < verts.length; j = i++) {
-      var xi = verts[i].x, yi = verts[i].y, xj = verts[j].x, yj = verts[j].y;
-      if (((yi > py) !== (yj > py)) &&
-          (px < (xj - xi) * (py - yi) / (yj - yi) + xi)) inside = !inside;
+  /* Best-matching band index for one shadow interval, or -1. */
+  function bestBandIndex(shadow, targetBands) {
+    var scores = bandScores([shadow], targetBands);
+    var best = -1;
+    var bestScore = -1;
+    var i;
+    for (i = 0; i < scores.length; i++) {
+      if (scores[i] > bestScore) {
+        bestScore = scores[i];
+        best = i;
+      }
     }
-    return inside;
+    return best;
   }
 
-  var api = {
-    SHAPES: SHAPES,
-    worldVertices: worldVertices,
+  /* Portrait position derived from a landscape position by the
+   * scaling rule in section 2: x * 720/1280, y * 1280/720.
+   * Sizes and rotations are unchanged. */
+  function toPortraitPosition(position) {
+    var p = pointOf(position);
+    return { x: p.x * 720 / 1280, y: p.y * 1280 / 720 };
+  }
+
+  function toLandscapePosition(position) {
+    var p = pointOf(position);
+    return { x: p.x * 1280 / 720, y: p.y * 720 / 1280 };
+  }
+
+  SA.Math = {
+    BOARD: BOARD,
+    WALL: WALL,
+    WIN_THRESHOLD: WIN_THRESHOLD,
+    BAND_MATCH_THRESHOLD: BAND_MATCH_THRESHOLD,
+    RING_INNER_RATIO: RING_INNER_RATIO,
+    boardSize: function (orientation) {
+      var o = normalOrientation(orientation);
+      return { width: BOARD[o].width, height: BOARD[o].height };
+    },
+    wall: function (orientation) {
+      var o = normalOrientation(orientation);
+      return { position: WALL[o].position, thickness: WALL[o].thickness, axis: WALL[o].axis };
+    },
     projectPoint: projectPoint,
+    shapeCorners: shapeCorners,
+    cornerAngles: cornerAngles,
     shadowInterval: shadowInterval,
-    // Aliases kept for callers using the alternate names.
-    objectInterval: shadowInterval,
-    projectObject: shadowInterval,
-    clampInterval: clampInterval,
-    unionLength: unionLength,
-    intersectionLength: intersectionLength,
+    shadowIntervals: shadowIntervals,
     mergeIntervals: mergeIntervals,
-    unionIntervals: mergeIntervals,
+    unionLength: totalLength,
+    overlapLength: overlapLength,
+    intervalIoU: intervalIoU,
     matchScore: matchScore,
-    computeMatch: matchScore,
+    matchForShapes: matchForShapes,
     bandScores: bandScores,
-    dist: dist,
-    pointInPoly: pointInPoly
+    bandScore: bandScore,
+    bestBandIndex: bestBandIndex,
+    isBandMatched: function (score) { return score >= BAND_MATCH_THRESHOLD; },
+    isWin: function (match) { return match >= WIN_THRESHOLD; },
+    isAlmost: function (match) { return match >= BAND_MATCH_THRESHOLD && match < WIN_THRESHOLD; },
+    toPortraitPosition: toPortraitPosition,
+    toLandscapePosition: toLandscapePosition
   };
-  return api;
-})();
-if (typeof module !== 'undefined' && module.exports) module.exports = SA.Math;
+
+  /* Aliases using the plainest names, for callers that prefer them. */
+  SA.Math.project = projectPoint;
+  SA.Math.corners = shapeCorners;
+  SA.Math.merge = mergeIntervals;
+  SA.Math.match = matchScore;
+  SA.Math.union = mergeIntervals;
+})(typeof globalThis !== 'undefined' ? globalThis : this);

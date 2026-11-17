@@ -1,380 +1,382 @@
-/* SHADOW ARCHITECT — Canvas 2D renderer.
-   Paints the observatory: the dark room, the amber point light and its
-   cone, the three draggable objects, their live shadows on the wall,
-   the ivory target silhouette with per-band match feedback, dust motes
-   and a vignette. No assets, no network, no fonts fetched remotely.
-   The controller owns canvas sizing (devicePixelRatio) and hands us a
-   view transform (tx/ty/scale) for pinch zoom; we only draw in stage
-   coordinates. shadowBlur is used sparingly — one glow pass on matched
-   target bands only — so a frame stays cheap. */
-var SA = (typeof SA !== 'undefined') ? SA : {};
-SA.Render = (function () {
-  'use strict';
+/* Shadow Architect — renderer.
+   Everything drawn on the canvas lives here: background, wall, target
+   silhouette, shadow bars, shapes, light and its cone, ambient drifting
+   particles, and the glow around each target band.
+   Public surface: SA.render.draw(state) paints one frame, and
+   SA.render.startParticles(count) (re)starts the particle field.
+   The draw function reads the game state described at the top of draw();
+   it never mutates that state. When the math module is present, shadow
+   intervals and band scores are taken from it; otherwise the small
+   projection helpers below are used as a fallback so a frame can still
+   be painted. */
+(function () {
+  var SA = (typeof window !== 'undefined' && window.SA) || {};
+  if (typeof window !== 'undefined') window.SA = SA;
 
-  var PAL = {
-    bgTop: '#131a3a', bgBot: '#0b1026', obsidian: '#0d0f1a',
-    wall: '#1a1f38', wallEdge: '#2c3464', violet: '#9d8df1',
-    ivory: '#f2ead8', cyan: '#6fd3e7', amber: '#e8b25c',
-    dim: '#8b93b8'
-  };
+  var MATCHED_AT = 0.85;
+  var CLOSE_AT = 0.5;
+  var DEFAULT_SHADOW_DEPTH = 92;
+  var RING_HOLE_RATIO = 0.53;
 
-  /* Band feedback thresholds. A band whose shadow covers at least 85% of
-     it is "almost there" (warm amber tint); at 90% it is matched and
-     lights up solid cyan. Callers may pass per-band IoU numbers in
-     state.bandIoU; when only the boolean state.bandMatched array is
-     supplied, true counts as matched. */
-  var ALMOST_IOU = 0.85;
-  var MATCH_IOU = 0.90;
+  var particles = [];
+  var lastTime = 0;
 
-  function bandState(state, i) {
-    if (state.bandIoU && typeof state.bandIoU[i] === 'number') {
-      if (state.bandIoU[i] >= MATCH_IOU) return 'matched';
-      if (state.bandIoU[i] >= ALMOST_IOU) return 'almost';
-      return 'open';
+  function toRadians(degrees) { return degrees * Math.PI / 180; }
+
+  /* Fallback projection, used only when SA.Math is not loaded yet. */
+  function projectPointFallback(light, point, wallPosition, orientation) {
+    if (orientation === 'portrait') {
+      var dy = point.y - light.y;
+      if (dy === 0) return null;
+      var t = (wallPosition - light.y) / dy;
+      if (t <= 0) return null;
+      return light.x + (point.x - light.x) * t;
     }
-    if (state.bandMatched && state.bandMatched[i]) return 'matched';
-    return 'open';
+    var dx = point.x - light.x;
+    if (dx === 0) return null;
+    var s = (wallPosition - light.x) / dx;
+    if (s <= 0) return null;
+    return light.y + (point.y - light.y) * s;
   }
 
-  /* Dust motes drifting inside the light cone. A tiny deterministic
-     generator keeps the field stable between loads. */
-  var particles = [];
-  function initParticles(seed) {
+  function shapeCornersFallback(shape) {
+    var angles;
+    if (shape.shape === 'triangle') {
+      angles = [shape.rotation - 90, shape.rotation + 30, shape.rotation + 150];
+    } else if (shape.shape === 'hexagon') {
+      angles = [0, 60, 120, 180, 240, 300].map(function (a) { return a + shape.rotation; });
+    } else {
+      angles = [];
+      for (var i = 0; i < 12; i++) angles.push(shape.rotation + i * 30);
+    }
+    return angles.map(function (a) {
+      var r = toRadians(a);
+      return { x: shape.x + Math.cos(r) * shape.radius, y: shape.y + Math.sin(r) * shape.radius };
+    });
+  }
+
+  function shadowIntervalFallback(shape, light, wallPosition, orientation) {
+    var values = [];
+    shapeCornersFallback(shape).forEach(function (corner) {
+      var p = projectPointFallback(light, corner, wallPosition, orientation);
+      if (p !== null && isFinite(p)) values.push(p);
+    });
+    if (!values.length) return null;
+    return { low: Math.min.apply(null, values), high: Math.max.apply(null, values) };
+  }
+
+  function intervalOverlap(aLow, aHigh, bLow, bHigh) {
+    return Math.max(0, Math.min(aHigh, bHigh) - Math.max(aLow, bLow));
+  }
+
+  function bandScoreFallback(shadow, band) {
+    if (!shadow) return 0;
+    var inter = intervalOverlap(shadow.low, shadow.high, band.low, band.high);
+    var union = Math.max(shadow.high, band.high) - Math.min(shadow.low, band.low);
+    return union <= 0 ? 0 : inter / union;
+  }
+
+  function startParticles(count) {
+    var total = count || 48;
     particles = [];
-    var s = seed || 12345;
-    function rnd() { s = (s * 16807) % 2147483647; return s / 2147483647; }
-    for (var i = 0; i < 36; i++) {
+    for (var i = 0; i < total; i++) {
       particles.push({
-        u: rnd(), v: rnd(),
-        r: 0.8 + rnd() * 1.8,
-        sp: 0.00008 + rnd() * 0.00025,
-        tw: rnd() * 6.28
+        x: Math.random(),
+        y: Math.random(),
+        size: 0.8 + Math.random() * 1.8,
+        speedX: (Math.random() - 0.5) * 0.012,
+        speedY: (Math.random() - 0.5) * 0.008,
+        cyan: Math.random() < 0.5,
+        alpha: 0.15 + Math.random() * 0.35
       });
     }
   }
-  initParticles(20261116);
 
-  /* Top-level frame: clear, apply the view transform, paint back to
-     front, restore. Signature matches the controller's call. */
-  function draw(state, ctx, layout, view, timeMs) {
-    var W = layout.W, H = layout.H;
-    ctx.save();
-    ctx.clearRect(0, 0, W, H);
-    ctx.translate(view.tx, view.ty);
-    ctx.scale(view.scale, view.scale);
-
-    drawRoom(ctx, layout);
-    drawLightCone(ctx, state, layout);
-    drawTarget(ctx, layout, state);
-    drawShadows(ctx, state, layout);
-    drawObjects(ctx, state, layout);
-    drawLight(ctx, state, layout, timeMs);
-    drawParticles(ctx, state, layout, timeMs);
-    drawVignette(ctx, layout);
-    ctx.restore();
-  }
-
-  /* The room: vertical midnight gradient, floor/ceiling lines, the wall
-     panel the shadows land on, a soft ambient-occlusion falloff at the
-     wall edge, and faint platform lines on the open floor. */
-  function drawRoom(ctx, layout) {
-    var W = layout.W, H = layout.H;
-    var g = ctx.createLinearGradient(0, 0, 0, H);
-    g.addColorStop(0, PAL.bgTop);
-    g.addColorStop(1, PAL.bgBot);
-    ctx.fillStyle = g;
-    ctx.fillRect(0, 0, W, H);
-
-    ctx.strokeStyle = 'rgba(157,141,241,0.16)';
-    ctx.lineWidth = 2;
-    ctx.beginPath(); ctx.moveTo(0, H - 26); ctx.lineTo(W, H - 26); ctx.stroke();
-    ctx.beginPath(); ctx.moveTo(0, 26); ctx.lineTo(W, 26); ctx.stroke();
-
-    var span = layout.wallSpan[1] - layout.wallSpan[0];
-    ctx.fillStyle = PAL.wall;
-    ctx.strokeStyle = PAL.wallEdge;
-    ctx.lineWidth = 2;
-    if (layout.axis === 'x') {
-      ctx.fillRect(layout.wall, layout.wallSpan[0] - 18, layout.wallThick + 40, span + 36);
-      ctx.strokeRect(layout.wall, layout.wallSpan[0] - 18, layout.wallThick + 40, span + 36);
-      var ao = ctx.createLinearGradient(layout.wall - 90, 0, layout.wall, 0);
-      ao.addColorStop(0, 'rgba(0,0,0,0)');
-      ao.addColorStop(1, 'rgba(0,0,0,0.45)');
-      ctx.fillStyle = ao;
-      ctx.fillRect(layout.wall - 90, layout.wallSpan[0] - 18, 90, span + 36);
-    } else {
-      ctx.fillRect(layout.wallSpan[0] - 18, layout.wall, span + 36, layout.wallThick + 40);
-      ctx.strokeRect(layout.wallSpan[0] - 18, layout.wall, span + 36, layout.wallThick + 40);
-      var ao2 = ctx.createLinearGradient(0, layout.wall - 90, 0, layout.wall);
-      ao2.addColorStop(0, 'rgba(0,0,0,0)');
-      ao2.addColorStop(1, 'rgba(0,0,0,0.45)');
-      ctx.fillStyle = ao2;
-      ctx.fillRect(layout.wallSpan[0] - 18, layout.wall - 90, span + 36, 90);
-    }
-
-    ctx.strokeStyle = 'rgba(111,211,231,0.10)';
-    ctx.lineWidth = 1;
-    for (var i = 0; i < 4; i++) {
-      var y = H - 90 - i * 26;
+  function drawParticles(ctx, width, height, now) {
+    var dt = lastTime ? Math.min(0.05, (now - lastTime) / 1000) : 0.016;
+    lastTime = now;
+    particles.forEach(function (p) {
+      p.x += p.speedX * dt * 10;
+      p.y += p.speedY * dt * 10;
+      if (p.x < 0) p.x += 1;
+      if (p.x > 1) p.x -= 1;
+      if (p.y < 0) p.y += 1;
+      if (p.y > 1) p.y -= 1;
+      ctx.globalAlpha = p.alpha;
+      ctx.fillStyle = p.cyan ? '#6fd3e7' : '#f2ead8';
       ctx.beginPath();
-      ctx.moveTo(40, y);
-      ctx.lineTo(layout.axis === 'x' ? 320 : W - 40, y);
-      ctx.stroke();
-    }
-  }
-
-  /* The light cone: a soft amber wash from the fixture to the wall span,
-     drawn additively so it brightens rather than covers the room. */
-  function drawLightCone(ctx, state, layout) {
-    var L = state.light;
-    ctx.save();
-    ctx.globalCompositeOperation = 'lighter';
-    var g;
-    if (layout.axis === 'x') {
-      g = ctx.createLinearGradient(L.x, 0, layout.wall, 0);
-      g.addColorStop(0, 'rgba(232,178,92,0.20)');
-      g.addColorStop(1, 'rgba(232,178,92,0.02)');
-      ctx.fillStyle = g;
-      ctx.beginPath();
-      ctx.moveTo(L.x, L.y);
-      ctx.lineTo(layout.wall, layout.wallSpan[0]);
-      ctx.lineTo(layout.wall, layout.wallSpan[1]);
-      ctx.closePath();
+      ctx.arc(p.x * width, p.y * height, p.size, 0, Math.PI * 2);
       ctx.fill();
-    } else {
-      g = ctx.createLinearGradient(0, L.y, 0, layout.wall);
-      g.addColorStop(0, 'rgba(232,178,92,0.20)');
-      g.addColorStop(1, 'rgba(232,178,92,0.02)');
-      ctx.fillStyle = g;
-      ctx.beginPath();
-      ctx.moveTo(L.x, L.y);
-      ctx.lineTo(layout.wallSpan[0], layout.wall);
-      ctx.lineTo(layout.wallSpan[1], layout.wall);
-      ctx.closePath();
-      ctx.fill();
-    }
-    ctx.restore();
+    });
+    ctx.globalAlpha = 1;
   }
 
-  /* A target band's rectangle on the wall, oriented by the layout axis. */
-  function targetBarRect(layout, band, width) {
-    if (layout.axis === 'x') {
-      return { x: layout.wall + 6, y: band[0], w: width, h: band[1] - band[0] };
-    }
-    return { x: band[0], y: layout.wall + 6, w: band[1] - band[0], h: width };
-  }
-
-  /* The ivory target silhouette: one rounded bar per band. Unmatched
-     bands stay dashed ivory; a band at 85–89% IoU warms to an amber
-     "almost" tint; a matched band (>= 90%) turns solid cyan with a
-     single soft glow. The feedback only ever reflects the live shadow —
-     it never reveals a solution. */
-  function drawTarget(ctx, layout, state) {
+  function drawShape(ctx, shape, toScreen, isSelected) {
+    var corners = shapeCornersFallback(shape);
+    var centre = toScreen(shape.x, shape.y);
+    var scale = toScreen.scale;
     ctx.save();
-    for (var i = 0; i < layout.target.length; i++) {
-      var r = targetBarRect(layout, layout.target[i], layout.targetWidths[i]);
-      var st = bandState(state, i);
-      if (st === 'matched') {
-        ctx.setLineDash([]);
-        ctx.shadowColor = 'rgba(111,211,231,0.9)';
-        ctx.shadowBlur = 12;
-        ctx.fillStyle = 'rgba(111,211,231,0.38)';
-        ctx.strokeStyle = 'rgba(111,211,231,0.95)';
-        ctx.lineWidth = 2.5;
-        roundRect(ctx, r.x, r.y, r.w, r.h, 14);
-        ctx.fill();
-        ctx.stroke();
-        ctx.shadowBlur = 0;
-      } else if (st === 'almost') {
-        ctx.setLineDash([]);
-        ctx.fillStyle = 'rgba(232,178,92,0.30)';
-        ctx.strokeStyle = 'rgba(232,178,92,0.9)';
-        ctx.lineWidth = 2;
-        roundRect(ctx, r.x, r.y, r.w, r.h, 14);
-        ctx.fill();
-        ctx.stroke();
-      } else {
-        ctx.setLineDash([8, 6]);
-        ctx.strokeStyle = 'rgba(242,234,216,0.85)';
-        ctx.lineWidth = 2;
-        ctx.fillStyle = 'rgba(242,234,216,0.07)';
-        roundRect(ctx, r.x, r.y, r.w, r.h, 14);
-        ctx.fill();
-        ctx.stroke();
-      }
+    if (isSelected) {
+      ctx.shadowColor = '#6fd3e7';
+      ctx.shadowBlur = 18;
     }
-    ctx.restore();
-
-    ctx.save();
-    ctx.fillStyle = 'rgba(242,234,216,0.55)';
-    ctx.font = '600 13px system-ui, sans-serif';
-    ctx.textAlign = 'center';
-    if (layout.axis === 'x') ctx.fillText('TARGET', layout.wall + 52, layout.wallSpan[1] + 32);
-    else ctx.fillText('TARGET', layout.W / 2, layout.wall - 28);
-    ctx.restore();
-  }
-
-  /* Live shadows: each object's projected interval (SA.Math) is clamped
-     to the wall span and painted as a dark bar with a cyan rim. No
-     shadowBlur here — the rim carries the edge and the frame stays fast. */
-  function drawShadows(ctx, state, layout) {
-    ctx.save();
-    for (var i = 0; i < state.objects.length; i++) {
-      var iv = SA.Math.shadowInterval(state.objects[i], state.light, layout);
-      if (!iv) continue;
-      iv = SA.Math.clampInterval(iv, layout.wallSpan);
-      if (!iv) continue;
-      var width = layout.targetWidths[i % layout.targetWidths.length] - 26;
-      var r = targetBarRect(layout, [iv[0], iv[1]], width);
-      ctx.fillStyle = 'rgba(5,7,16,0.88)';
-      roundRect(ctx, r.x, r.y, r.w, r.h, 10);
-      ctx.fill();
-      ctx.strokeStyle = 'rgba(111,211,231,0.65)';
-      ctx.lineWidth = 1.5;
-      roundRect(ctx, r.x, r.y, r.w, r.h, 10);
-      ctx.stroke();
-    }
-    ctx.restore();
-  }
-
-  /* The three objects: filled polygons from SA.Math.worldVertices, in
-     their level colours. The selected object gets a brighter outline, a
-     centre dot and a dashed orbit ring; rings get their hollow centre
-     punched back out in the background colour. */
-  function drawObjects(ctx, state, layout) {
-    for (var i = 0; i < state.objects.length; i++) {
-      var o = state.objects[i];
-      var verts = SA.Math.worldVertices(o);
-      var selected = state.selectedId === o.id;
-      ctx.save();
-      ctx.beginPath();
-      ctx.moveTo(verts[0].x, verts[0].y);
-      for (var j = 1; j < verts.length; j++) ctx.lineTo(verts[j].x, verts[j].y);
-      ctx.closePath();
-      ctx.globalAlpha = 0.92;
-      ctx.fillStyle = o.color;
-      ctx.fill();
-      ctx.globalAlpha = 1;
-      ctx.lineWidth = selected ? 3 : 2;
-      ctx.strokeStyle = selected ? PAL.cyan : 'rgba(13,15,26,0.9)';
-      ctx.stroke();
-      if (o.shape === 'ring') {
-        ctx.beginPath();
-        ctx.arc(o.cx, o.cy, o.r * 0.53, 0, Math.PI * 2);
-        ctx.fillStyle = PAL.bgBot;
-        ctx.fill();
-        ctx.strokeStyle = 'rgba(13,15,26,0.9)';
-        ctx.lineWidth = 2;
-        ctx.stroke();
-      }
-      if (selected) {
-        ctx.beginPath();
-        ctx.arc(o.cx, o.cy, 5, 0, Math.PI * 2);
-        ctx.fillStyle = PAL.cyan;
-        ctx.fill();
-        ctx.beginPath();
-        ctx.arc(o.cx, o.cy, o.r + 10, 0, Math.PI * 2);
-        ctx.setLineDash([4, 6]);
-        ctx.strokeStyle = 'rgba(111,211,231,0.5)';
-        ctx.lineWidth = 1.5;
-        ctx.stroke();
-        ctx.setLineDash([]);
-      }
-      ctx.restore();
-    }
-  }
-
-  /* The point light: a ceiling/wall mount line, a pulsing radial glow,
-     the fixture body with an amber core, and a dashed selection ring
-     when the light itself is selected. */
-  function drawLight(ctx, state, layout, timeMs) {
-    var L = state.light;
-    var pulse = 1 + 0.05 * Math.sin(timeMs / 450);
-    ctx.save();
-    ctx.strokeStyle = 'rgba(242,234,216,0.35)';
-    ctx.lineWidth = 2;
     ctx.beginPath();
-    if (layout.axis === 'x') { ctx.moveTo(L.x, 26); ctx.lineTo(L.x, L.y - 16); }
-    else { ctx.moveTo(40, L.y); ctx.lineTo(L.x - 16, L.y); }
-    ctx.stroke();
-
-    var g = ctx.createRadialGradient(L.x, L.y, 2, L.x, L.y, 70 * pulse);
-    g.addColorStop(0, 'rgba(232,178,92,0.85)');
-    g.addColorStop(0.25, 'rgba(232,178,92,0.28)');
-    g.addColorStop(1, 'rgba(232,178,92,0)');
-    ctx.fillStyle = g;
-    ctx.beginPath();
-    ctx.arc(L.x, L.y, 70 * pulse, 0, Math.PI * 2);
-    ctx.fill();
-
-    ctx.beginPath();
-    ctx.arc(L.x, L.y, 15, 0, Math.PI * 2);
-    ctx.fillStyle = '#2a2f4a';
-    ctx.fill();
-    ctx.strokeStyle = PAL.amber;
-    ctx.lineWidth = 2;
-    ctx.stroke();
-    ctx.beginPath();
-    ctx.arc(L.x, L.y, 7, 0, Math.PI * 2);
-    ctx.fillStyle = PAL.amber;
-    ctx.fill();
-    if (state.selectedId === 'light') {
-      ctx.beginPath();
-      ctx.arc(L.x, L.y, 26, 0, Math.PI * 2);
-      ctx.setLineDash([4, 6]);
-      ctx.strokeStyle = PAL.cyan;
-      ctx.lineWidth = 1.5;
-      ctx.stroke();
-      ctx.setLineDash([]);
-    }
-    ctx.restore();
-  }
-
-  /* Dust motes: each particle interpolates along the cone (u) and across
-     it (v), widening with distance from the light, with a slow twinkle
-     and a gentle sinusoidal drift. */
-  function drawParticles(ctx, state, layout, timeMs) {
-    var L = state.light;
-    var span = layout.wallSpan[1] - layout.wallSpan[0];
-    ctx.save();
-    ctx.fillStyle = 'rgba(242,234,216,0.5)';
-    for (var i = 0; i < particles.length; i++) {
-      var p = particles[i];
-      var tw = 0.35 + 0.65 * Math.abs(Math.sin(timeMs / 900 + p.tw));
-      var drift = Math.sin(timeMs * p.sp + i) * 4;
-      var across = (p.v - 0.5) * span * (0.15 + 0.85 * p.u);
-      ctx.globalAlpha = 0.5 * tw * 0.6;
-      ctx.beginPath();
-      if (layout.axis === 'x') {
-        ctx.arc(L.x + p.u * (layout.wall - L.x), L.y + across + drift, p.r, 0, Math.PI * 2);
-      } else {
-        ctx.arc(L.x + across + drift, L.y + p.u * (layout.wall - L.y), p.r, 0, Math.PI * 2);
-      }
-      ctx.fill();
-    }
-    ctx.restore();
-  }
-
-  /* Soft darkening toward the corners so the lit centre holds focus. */
-  function drawVignette(ctx, layout) {
-    var g = ctx.createRadialGradient(
-      layout.W / 2, layout.H / 2, Math.min(layout.W, layout.H) * 0.42,
-      layout.W / 2, layout.H / 2, Math.max(layout.W, layout.H) * 0.75);
-    g.addColorStop(0, 'rgba(0,0,0,0)');
-    g.addColorStop(1, 'rgba(0,0,0,0.38)');
-    ctx.fillStyle = g;
-    ctx.fillRect(0, 0, layout.W, layout.H);
-  }
-
-  function roundRect(ctx, x, y, w, h, r) {
-    ctx.beginPath();
-    ctx.moveTo(x + r, y);
-    ctx.arcTo(x + w, y, x + w, y + h, r);
-    ctx.arcTo(x + w, y + h, x, y + h, r);
-    ctx.arcTo(x, y + h, x, y, r);
-    ctx.arcTo(x, y, x + w, y, r);
+    corners.forEach(function (corner, i) {
+      var p = toScreen(corner.x, corner.y);
+      if (i === 0) ctx.moveTo(p.x, p.y); else ctx.lineTo(p.x, p.y);
+    });
     ctx.closePath();
+    ctx.fillStyle = shape.color || '#f2ead8';
+    ctx.fill();
+    if (shape.shape === 'ring') {
+      /* Cut the annulus hole with an even-odd inner circle. */
+      ctx.beginPath();
+      ctx.arc(centre.x, centre.y, shape.radius * scale * RING_HOLE_RATIO, 0, Math.PI * 2);
+      ctx.fillStyle = '#0a0e27';
+      ctx.fill();
+    }
+    ctx.shadowBlur = 0;
+    ctx.lineWidth = isSelected ? 3 : 1.5;
+    ctx.strokeStyle = isSelected ? '#ffffff' : 'rgba(242, 234, 216, 0.7)';
+    ctx.beginPath();
+    corners.forEach(function (corner, i) {
+      var p = toScreen(corner.x, corner.y);
+      if (i === 0) ctx.moveTo(p.x, p.y); else ctx.lineTo(p.x, p.y);
+    });
+    ctx.closePath();
+    ctx.stroke();
+    ctx.restore();
   }
 
-  return { draw: draw, initParticles: initParticles, PAL: PAL };
+  /* Draw one frame.
+     Expected state shape (all world coordinates are in world units):
+       {
+         orientation: 'landscape' or 'portrait',
+         worldWidth: number, worldHeight: number,
+         wallPosition: number, wallThickness: number,
+         objects: [{ id, shape: 'triangle'|'ring'|'hexagon',
+                      x, y, radius, rotation, color }],
+         light: { x, y },
+         targetBands: [{ low, high, depth }],
+         shadows: optional [{ id, low, high }] (computed if absent),
+         bandScores: optional [number, ...] aligned with targetBands
+                     (computed if absent),
+         match: number 0..1,
+         selectedId: string or null,
+         zoom: number (1 = fitted view),
+         view: optional { scale, offsetX, offsetY } (overrides zoom fit),
+         winPending: boolean,
+         state: string (for example 'playing')
+       }
+     The canvas is found by id 'game-canvas'. */
+  function draw(state) {
+    if (!state || typeof document === 'undefined') return;
+    var canvas = document.getElementById('game-canvas');
+    if (!canvas) return;
+    var ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    var cssWidth = canvas.clientWidth || canvas.width || 720;
+    var cssHeight = canvas.clientHeight || canvas.height || 720;
+    var dpr = (typeof window !== 'undefined' && window.devicePixelRatio) || 1;
+    if (canvas.width !== Math.round(cssWidth * dpr) || canvas.height !== Math.round(cssHeight * dpr)) {
+      canvas.width = Math.round(cssWidth * dpr);
+      canvas.height = Math.round(cssHeight * dpr);
+    }
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+    var orientation = state.orientation || 'landscape';
+    var portrait = orientation === 'portrait';
+    var worldWidth = state.worldWidth || (portrait ? 720 : 1280);
+    var worldHeight = state.worldHeight || (portrait ? 1280 : 720);
+    var wallPosition = state.wallPosition != null ? state.wallPosition : (portrait ? 1010 : 1080);
+    var wallThickness = state.wallThickness || 64;
+    var objects = state.objects || [];
+    var light = state.light || { x: 185, y: 360 };
+    var targetBands = state.targetBands || [];
+    var zoom = state.zoom || 1;
+
+    var view = state.view;
+    var scale, offsetX, offsetY;
+    if (view) {
+      scale = view.scale; offsetX = view.offsetX; offsetY = view.offsetY;
+    } else {
+      var fit = Math.min(cssWidth / worldWidth, cssHeight / worldHeight);
+      scale = fit * zoom;
+      offsetX = (cssWidth - worldWidth * scale) / 2;
+      offsetY = (cssHeight - worldHeight * scale) / 2;
+    }
+    function toScreen(x, y) {
+      return { x: offsetX + x * scale, y: offsetY + y * scale };
+    }
+    toScreen.scale = scale;
+
+    /* Background: vertical gradient, midnight blue to obsidian. */
+    var bg = ctx.createLinearGradient(0, 0, 0, cssHeight);
+    bg.addColorStop(0, '#0a0e27');
+    bg.addColorStop(1, '#05070f');
+    ctx.fillStyle = bg;
+    ctx.fillRect(0, 0, cssWidth, cssHeight);
+
+    /* Faint violet nebula glow. */
+    var nebula = ctx.createRadialGradient(cssWidth * 0.7, cssHeight * 0.25, 0, cssWidth * 0.7, cssHeight * 0.25, cssWidth * 0.55);
+    nebula.addColorStop(0, 'rgba(157, 141, 241, 0.16)');
+    nebula.addColorStop(1, 'rgba(157, 141, 241, 0)');
+    ctx.fillStyle = nebula;
+    ctx.fillRect(0, 0, cssWidth, cssHeight);
+
+    if (!particles.length) startParticles(48);
+    drawParticles(ctx, cssWidth, cssHeight, (typeof performance !== 'undefined' ? performance.now() : Date.now()));
+
+    /* Light cone: soft translucent amber spreading toward the wall. */
+    var lightScreen = toScreen(light.x, light.y);
+    var wallScreen = toScreen(wallPosition, 0);
+    var cone = ctx.createLinearGradient(lightScreen.x, lightScreen.y, wallScreen.x, lightScreen.y);
+    cone.addColorStop(0, 'rgba(242, 181, 68, 0.20)');
+    cone.addColorStop(1, 'rgba(242, 181, 68, 0.02)');
+    ctx.fillStyle = cone;
+    ctx.beginPath();
+    if (portrait) {
+      var wallY = toScreen(0, wallPosition).y;
+      ctx.moveTo(lightScreen.x, lightScreen.y);
+      ctx.lineTo(toScreen(0, wallPosition).x, wallY);
+      ctx.lineTo(toScreen(worldWidth, wallPosition).x, wallY);
+    } else {
+      ctx.moveTo(lightScreen.x, lightScreen.y);
+      ctx.lineTo(wallScreen.x, toScreen(0, 0).y);
+      ctx.lineTo(wallScreen.x, toScreen(0, worldHeight).y);
+    }
+    ctx.closePath();
+    ctx.fill();
+
+    /* Shadows and band scores, from the math module when available.
+     * SA.Math.shadowInterval(shape, light, orientation) returns an
+     * array [low, high]; convert it to the { low, high } shape the
+     * drawing code below uses. SA.Math.bandScore takes a shadow as
+     * an [low, high] array, so pass [shadow.low, shadow.high]. */
+    var shadows = state.shadows;
+    if (!shadows) {
+      shadows = objects.map(function (obj) {
+        var interval = null;
+        if (SA.Math && SA.Math.shadowInterval) {
+          interval = SA.Math.shadowInterval(obj, light, orientation);
+        } else {
+          interval = shadowIntervalFallback(obj, light, wallPosition, orientation);
+        }
+        if (Array.isArray(interval)) {
+          return { id: obj.id, low: interval[0], high: interval[1] };
+        }
+        return interval ? { id: obj.id, low: interval.low, high: interval.high } : { id: obj.id, low: 0, high: 0 };
+      });
+    }
+    var bandScores = state.bandScores;
+    if (!bandScores) {
+      bandScores = targetBands.map(function (band) {
+        var best = 0;
+        shadows.forEach(function (shadow) {
+          var score;
+          if (SA.Math && SA.Math.bandScore) {
+            score = SA.Math.bandScore([shadow.low, shadow.high], band);
+          } else {
+            score = bandScoreFallback(shadow, band);
+          }
+          if (score > best) best = score;
+        });
+        return best;
+      });
+    }
+    /* Best-matching band per shape, for shadow-bar depth. */
+    var shadowDepth = {};
+    shadows.forEach(function (shadow) {
+      var bestScore = -1, bestDepth = DEFAULT_SHADOW_DEPTH;
+      targetBands.forEach(function (band) {
+        var score = SA.Math && SA.Math.bandScore
+          ? SA.Math.bandScore([shadow.low, shadow.high], band) : bandScoreFallback(shadow, band);
+        if (score > bestScore) { bestScore = score; bestDepth = band.depth || DEFAULT_SHADOW_DEPTH; }
+      });
+      shadowDepth[shadow.id] = bestScore > 0 ? bestDepth : DEFAULT_SHADOW_DEPTH;
+    });
+
+    /* Wall: dark violet-grey bar with a lighter edge on the play side. */
+    ctx.fillStyle = '#2a2740';
+    if (portrait) {
+      var wallTop = toScreen(0, wallPosition);
+      ctx.fillRect(0, wallTop.y, cssWidth, wallThickness * scale);
+      ctx.fillStyle = 'rgba(242, 234, 216, 0.55)';
+      ctx.fillRect(0, wallTop.y, cssWidth, 2);
+    } else {
+      ctx.fillRect(wallScreen.x, 0, wallThickness * scale, cssHeight);
+      ctx.fillStyle = 'rgba(242, 234, 216, 0.55)';
+      ctx.fillRect(wallScreen.x, 0, 2, cssHeight);
+    }
+
+    /* Target bands with glow: cyan when matched, amber when close. */
+    targetBands.forEach(function (band, i) {
+      var score = bandScores[i] || 0;
+      var matched = score >= MATCHED_AT;
+      var close = !matched && score >= CLOSE_AT;
+      var glow = matched ? '#6fd3e7' : (close ? '#f2b544' : null);
+      var rect;
+      if (portrait) {
+        var a = toScreen(band.low, wallPosition);
+        var b = toScreen(band.high, wallPosition);
+        rect = { x: a.x, y: a.y, w: b.x - a.x, h: (band.depth || DEFAULT_SHADOW_DEPTH) * scale };
+      } else {
+        var c = toScreen(wallPosition, band.low);
+        var d = toScreen(wallPosition, band.high);
+        rect = { x: c.x, y: c.y, w: (band.depth || DEFAULT_SHADOW_DEPTH) * scale, h: d.y - c.y };
+      }
+      if (glow) {
+        ctx.save();
+        ctx.shadowColor = glow;
+        ctx.shadowBlur = 22;
+        ctx.fillStyle = glow;
+        ctx.globalAlpha = 0.35;
+        ctx.fillRect(rect.x, rect.y, rect.w, rect.h);
+        ctx.restore();
+      }
+      ctx.fillStyle = '#f2ead8';
+      ctx.fillRect(rect.x, rect.y, rect.w, rect.h);
+    });
+
+    /* Shadow bars: dark translucent, over the target where they overlap. */
+    shadows.forEach(function (shadow) {
+      var depth = shadowDepth[shadow.id] || DEFAULT_SHADOW_DEPTH;
+      ctx.fillStyle = 'rgba(5, 7, 15, 0.55)';
+      if (portrait) {
+        var a = toScreen(shadow.low, wallPosition);
+        var b = toScreen(shadow.high, wallPosition);
+        ctx.fillRect(a.x, a.y, b.x - a.x, depth * scale);
+      } else {
+        var c = toScreen(wallPosition, shadow.low);
+        var d = toScreen(wallPosition, shadow.high);
+        ctx.fillRect(c.x, c.y, depth * scale, d.y - c.y);
+      }
+    });
+
+    /* Shapes. */
+    objects.forEach(function (obj) {
+      drawShape(ctx, obj, toScreen, obj.id === state.selectedId);
+    });
+
+    /* Light: bright amber core with a radial glow. */
+    var glowRadius = 46 * scale;
+    var lightGlow = ctx.createRadialGradient(lightScreen.x, lightScreen.y, 0, lightScreen.x, lightScreen.y, glowRadius);
+    lightGlow.addColorStop(0, 'rgba(242, 181, 68, 0.85)');
+    lightGlow.addColorStop(1, 'rgba(242, 181, 68, 0)');
+    ctx.fillStyle = lightGlow;
+    ctx.beginPath();
+    ctx.arc(lightScreen.x, lightScreen.y, glowRadius, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = '#f2b544';
+    ctx.beginPath();
+    ctx.arc(lightScreen.x, lightScreen.y, Math.max(4, 7 * scale), 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = '#ffffff';
+    ctx.beginPath();
+    ctx.arc(lightScreen.x, lightScreen.y, Math.max(2, 3 * scale), 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  SA.render = { draw: draw, startParticles: startParticles };
 })();
